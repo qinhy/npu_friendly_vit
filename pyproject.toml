@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "npu-friendly-vit"
+version = "0.1.0"
+description = "A small, conv-free, NPU-friendly Vision Transformer for AMD Ryzen AI (Hawk Point / XDNA1, XINT8 flow)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10,<3.14"
+authors = [
+    { name = "koki.chin", email = "qinhunagyi@gmail.com" },
+]
+keywords = [
+    "vision-transformer",
+    "vit",
+    "npu",
+    "ryzen-ai",
+    "onnx",
+    "quantization",
+    "int8",
+    "pytorch",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24",
+    "onnx>=1.15",
+    "onnxruntime>=1.17",
+    "torch>=2.2",
+    "torchvision>=0.17",
+]
+
+[[tool.uv.index]]
+name = "torch-cuda"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "torch-cuda" }
+torchvision = { index = "torch-cuda" }
+
+[project.scripts]
+npu-vit-selftest = "npu_friendly_vit.model:selftest"
+npu-vit-train = "npu_friendly_vit.train:main"
+npu-vit-quantize = "npu_friendly_vit.quantize:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/npu_friendly_vit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["npu_friendly_vit"]
