@@ -1,8 +1,8 @@
 """Standard RMSNorm + QK-Norm ViT -> calibrated ReLU / PWL NPU ViT.
 
 Teacher trains with dynamic RMSNorm, per-head Q/K RMSNorm, GELU and Softmax.
-Student replaces RMSNorm by an equivalent MatMul decomposition, calibrates
-GELU -> affine-corrected ReLU, and uses fixed per-head PWL Softmax coefficients.
+Student uses equivalent MatMul RMSNorm, calibrated GELU -> ReLU, and either
+a learned six-neuron per-head ReLU MLP, fixed PWL, or native Softmax.
 The preceding LayerNorm (ln) architecture remains available as an ablation.
 FP32 graph suitability and real INT8 NPU partitioning are distinct checks.
 """
@@ -154,6 +154,22 @@ class CalibratedReLU(nn.Module):
         return torch.relu(x) * self.gain + self.bias
 
 
+def _upgrade_legacy_hinge_parameters(state_dict, prefix, count, old_bias, old_coef):
+    """Convert old per-neuron checkpoint tensors to packed per-head tensors.
+
+    This runs only while loading checkpoints; there is no loop in inference.
+    """
+    bkey, ckey = prefix + "biases", prefix + "coefs"
+    if bkey in state_dict and ckey in state_dict:
+        return
+    bkeys = [prefix + old_bias.format(i) for i in range(count)]
+    ckeys = [prefix + old_coef.format(i) for i in range(count)]
+    if not all(k in state_dict for k in bkeys + ckeys):
+        return
+    state_dict[bkey] = torch.cat([state_dict.pop(k) for k in bkeys], dim=-1)
+    state_dict[ckey] = torch.cat([state_dict.pop(k) for k in ckeys], dim=-1).transpose(-1, -2).contiguous()
+
+
 class FixedPWLSoftmax(nn.Module):
     """Per-head fixed PWL approximation to Softmax with optional score centering.
 
@@ -212,12 +228,19 @@ class FixedPWLSoftmax(nn.Module):
         slopes = (values[:, 1:] - values[:, :-1]) / (knots[:, 1:] - knots[:, :-1])
         delta = torch.cat((slopes[:, :1], slopes[:, 1:] - slopes[:, :-1]), dim=1)
         self.register_buffer("base", values[:, :1].reshape(1, -1, 1, 1).clone())
-        for i in range(segments):
-            # Per-head raw-score coefficients are fixed after calibration.
-            # Individual buffers avoid dynamic Gather/Slice in ONNX.
-            self.register_buffer(f"bias_{i}", -knots[:, i].view(1, -1, 1, 1).clone())
-            self.register_buffer(f"coef_{i}", delta[:, i].view(1, -1, 1, 1).clone())
+        # Packed constant coefficients for a single batched MatMul, rather
+        # than `segments` separate ReLU/Mul/Add nodes in the ONNX graph.
+        # biases [1,H,1,M], coefs [1,H,M,1]
+        self.register_buffer("biases", -knots[:, :segments].view(1, -1, 1, segments).clone())
+        self.register_buffer("coefs", delta.view(1, -1, segments, 1).clone())
         self.register_buffer("ones", torch.ones(n_tokens, 1, device=low.device))
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        _upgrade_legacy_hinge_parameters(state_dict, prefix, self.segments,
+                                         "bias_{}", "coef_{}")
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
 
     def center_scores(self, scores):
         if self.score_center == "max":
@@ -229,14 +252,183 @@ class FixedPWLSoftmax(nn.Module):
     def forward(self, scores):
         centered = self.center_scores(scores)
         s = torch.minimum(torch.maximum(centered, self.low), self.high)
-        exp_pwl = self.base
-        for i in range(self.segments):
-            exp_pwl = exp_pwl + getattr(self, f"coef_{i}") * torch.relu(
-                s + getattr(self, f"bias_{i}")
-            )
-        # A small roundoff floor is permitted: no row-wise reduction max/Exp.
-        exp_pwl = torch.maximum(exp_pwl, self.base * 0.5)
+        b, h, q, k = s.shape
+        # [B,H,Q*K,1] + [1,H,1,M] -> [B,H,Q*K,M]
+        features = torch.relu(s.reshape(b, h, q * k, 1) + self.biases)
+        # [B,H,Q*K,M] @ [1,H,M,1] -> [B,H,Q*K,1]
+        e = (self.base + (features @ self.coefs)).reshape(b, h, q, k)
+        exp_pwl = torch.maximum(e, self.base * 0.5)
         return exp_pwl / (exp_pwl @ self.ones)
+
+
+class LearnedMLPSoftmax(nn.Module):
+    """Per-head six-neuron scalar ReLU MLP for the exponential in Softmax.
+
+    f_h(s) = base_h + sum_i coef_hi * ReLU(s - knot_hi)
+
+    This is a constrained 1 -> hidden -> 1 ReLU MLP: the first-layer input
+    weights are fixed at +1, while hidden biases (-knot), output weights and
+    output bias are LEARNED from attention-score rows. Fixing the input weights
+    is equivalent to a continuous piecewise-linear network and avoids extra
+    Mul nodes in ONNX. Hidden neurons are evaluated together by one batched
+    ReLU + MatMul (no per-neuron Python loop or multi-node chain).
+    There are H * (2*hidden+1) trainable scalars.
+
+    No exp or row-wise ReduceMax in inference with score_center='mean'. The
+    row reduction and division remain necessary. All neuron weights can be
+    kept after learning or frozen to constants by calling .freeze().
+    """
+
+    def __init__(self, n_tokens, low, high, hidden=6, score_center="mean",
+                 knot_spacing="geometric", min_exp=1e-8):
+        super().__init__()
+        if hidden < 2:
+            raise ValueError("hidden must be >= 2")
+        if score_center not in {"none", "mean", "max"}:
+            raise ValueError("invalid score_center")
+        if knot_spacing not in {"uniform", "geometric"}:
+            raise ValueError("invalid knot_spacing")
+        low = torch.as_tensor(low, dtype=torch.float32).detach().flatten()
+        high = torch.as_tensor(high, dtype=torch.float32).detach().flatten()
+        if low.numel() == 0 or low.shape != high.shape or not torch.isfinite(low).all() or not torch.isfinite(high).all() or not (high > low).all():
+            raise ValueError("invalid per-head score bounds")
+        self.hidden = int(hidden)
+        self.score_center = score_center
+        self.knot_spacing = knot_spacing
+        self.min_exp = float(min_exp)
+        self.register_buffer("low", low.view(1, -1, 1, 1).clone())
+        self.register_buffer("high", high.view(1, -1, 1, 1).clone())
+        self.register_buffer("ones", torch.ones(n_tokens, 1))
+        self.register_buffer("min_value", torch.tensor(float(min_exp)))
+        # Warm start at the same six-segment interpolation of exp(s-high) used
+        # by fixed PWL. The knot positions and slopes are then optimized.
+        t = torch.linspace(0, 1, hidden + 1, device=low.device)
+        width = (high - low)[:, None]
+        if knot_spacing == "geometric":
+            knots = high[:, None] - torch.expm1((1 - t[None, :]) * torch.log1p(width))
+        else:
+            knots = low[:, None] + width * t[None, :]
+        values = torch.exp((knots - high[:, None]).clamp(min=-80)).clamp_min(min_exp)
+        slopes = (values[:, 1:] - values[:, :-1]) / (knots[:, 1:] - knots[:, :-1])
+        deltas = torch.cat((slopes[:, :1], slopes[:, 1:] - slopes[:, :-1]), dim=1)
+        self.base = nn.Parameter(values[:, :1].view(1, -1, 1, 1).clone())
+        # Two packed trainable tensors replace 2*hidden ParameterList entries.
+        # Exactly 2*hidden+1 learnable scalars per head are retained.
+        self.biases = nn.Parameter((-knots[:, :hidden]).view(1, -1, 1, hidden).clone())
+        self.coefs = nn.Parameter(deltas.view(1, -1, hidden, 1).clone())
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Supports vit_npu*.pt created by the original per-neuron for-loop model.
+        _upgrade_legacy_hinge_parameters(state_dict, prefix, self.hidden,
+                                         "biases.{}", "coefs.{}")
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
+
+    def center_scores(self, scores):
+        if self.score_center == "max":
+            return scores - scores.amax(dim=-1, keepdim=True)
+        if self.score_center == "mean":
+            return scores - (scores @ self.ones) * (1.0 / self.ones.shape[0])
+        return scores
+
+    def forward(self, scores):
+        z = self.center_scores(scores)
+        z = torch.minimum(torch.maximum(z, self.low), self.high)
+        b, h, q, k = z.shape
+        # A single batched hidden-layer ReLU and a single batched MatMul;
+        # there is NO Python loop over neurons during training or inference.
+        hidden = torch.relu(z.reshape(b, h, q * k, 1) + self.biases)
+        values = (self.base + hidden @ self.coefs).reshape(b, h, q, k)
+        positive = torch.maximum(values, self.min_value)
+        return positive / (positive @ self.ones)
+
+    def freeze(self):
+        self.requires_grad_(False)
+        return self
+
+
+class _ScoreRowSamples:
+    """Capture bounded representative attention rows for standalone MLP fitting."""
+
+    def __init__(self, max_rows=1536, per_batch=256):
+        if max_rows <= 1:
+            raise ValueError("max_rows must exceed one")
+        self.max_rows = int(max_rows)
+        self.per_batch = int(per_batch)
+        self.samples = []
+        self.count = 0
+
+    @torch.no_grad()
+    def hook(self, module, args):
+        if self.count >= self.max_rows:
+            return
+        x = args[0].detach()  # [B,H,Q,K]
+        rows = x.permute(0, 2, 1, 3).reshape(-1, x.shape[1], x.shape[3])
+        take = min(self.per_batch, self.max_rows - self.count, rows.shape[0])
+        indices = torch.linspace(0, rows.shape[0] - 1, take, device=rows.device).long()
+        self.samples.append(rows[indices].float().cpu())
+        self.count += take
+
+    def get(self):
+        if not self.samples:
+            raise ValueError("No attention rows collected")
+        return torch.cat(self.samples, 0)
+
+
+def _row_kl(model, rows):
+    """KL(exact_softmax(scores) || learned_softmax(scores)), mean over rows/heads."""
+    # rows [R,H,K] -> scores [1,H,R,K]
+    scores = rows.permute(1, 0, 2).unsqueeze(0)
+    target = torch.softmax(scores, dim=-1)
+    predicted = model(scores).clamp_min(1e-9)
+    return (target * (target.clamp_min(1e-9).log() - predicted.log())).sum(-1).mean()
+
+
+def fit_mlp_softmax(module, rows, *, steps=150, lr=0.0003, batch_rows=128, verbose=False):
+    """Learn per-head MLP coefficients from current exact attention distributions.
+
+    Uses held-out CALIBRATION rows for early model selection (never the test set).
+    Only module parameters are optimized. The ViT and source score rows stay
+    frozen. The best validation-fit parameters are restored.
+    """
+    if steps < 0 or lr <= 0:
+        raise ValueError("steps must be nonnegative and lr positive")
+    if rows.ndim != 3 or rows.shape[0] < 2:
+        raise ValueError("rows must have shape [R,H,K] with at least 2 rows")
+    device = module.base.device
+    rows = rows.to(device)
+    # Random split drawn from a LOCAL generator (no global RNG perturbation).
+    rng = torch.Generator(device="cpu").manual_seed(20261124)
+    order = torch.randperm(rows.shape[0], generator=rng).to(device)
+    n_val = max(1, int(0.15 * rows.shape[0]))
+    train_rows, val_rows = rows[order[n_val:]], rows[order[:n_val]]
+    with torch.no_grad():
+        first = float(_row_kl(module, val_rows))
+    best, best_state = first, {k: v.detach().clone() for k, v in module.state_dict().items()}
+    if steps:
+        opt = torch.optim.Adam(module.parameters(), lr=lr, weight_decay=0.0)
+        with torch.enable_grad():
+            for step in range(steps):
+                idx = torch.randint(0, len(train_rows),
+                                    (min(batch_rows, len(train_rows)),), device=device)
+                loss = _row_kl(module, train_rows[idx])
+                if not torch.isfinite(loss):
+                    raise RuntimeError("Nonfinite MLP approximation loss")
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(module.parameters(), 5.0)
+                opt.step()
+                if (step + 1) % 10 == 0 or step + 1 == steps:
+                    with torch.no_grad():
+                        current = float(_row_kl(module, val_rows))
+                        if current < best:
+                            best = current
+                            best_state = {k: v.detach().clone() for k, v in module.state_dict().items()}
+    module.load_state_dict(best_state)
+    if verbose:
+        print(f"      6-neuron MLP fit: heldout attention KL {first:.6f} -> {best:.6f} ({steps} steps)", flush=True)
+    return {"initial_kl": first, "best_kl": best, "train_rows": len(train_rows), "validation_rows": len(val_rows)}
 
 
 class Attention(nn.Module):
@@ -538,6 +730,12 @@ def calibrate_npu(
     *,
     max_batches=None,
     softmax_segments=12,
+    softmax_kind="mlp",
+    mlp_hidden=6,
+    mlp_fit_steps=150,
+    mlp_fit_lr=0.0003,
+    mlp_rows=1536,
+    mlp_freeze=False,
     tail=0.001,
     margin=0.05,
     radius=3.0,
@@ -545,21 +743,27 @@ def calibrate_npu(
     knot_spacing="geometric",
     verbose=True,
 ):
-    """Fit GELU -> gain*ReLU+bias and score -> fixed PWL, block by block.
+    """Convert GELU to calibrated ReLU; calibrate per-head Softmax approximation.
 
-    Works both before and after fine-tuning. ReLU coefficients and fixed PWL
-    buffers are fitted from *current* student activations in eval mode.
+    mlp: warm-start a six-hinge ReLU network, fit its knot/slope coefficients to
+         *current student attention scores* with an exact Softmax KL objective.
+    pwl: keep the original fixed, 12-segment per-head approximation.
+    native: keep exact Softmax for an NPU performance reference.
     """
+    if softmax_kind not in {"mlp", "pwl", "native"}:
+        raise ValueError("softmax_kind must be mlp, pwl, or native")
     _check_calib_loader(calibration_loader)
     student.eval()
     device = next(student.parameters()).device
     for idx, block in enumerate(student.blocks):
         relu_stats = _ReLURegression(block.fc1.out_features)
         score_stats = _RangeSamples(heads=block.attn.heads, score_center=score_center)
-        hooks = [
-            block.act.register_forward_pre_hook(relu_stats.hook),
-            block.attn.norm.register_forward_pre_hook(score_stats.hook),
-        ]
+        row_stats = _ScoreRowSamples(max_rows=mlp_rows) if softmax_kind == "mlp" else None
+        hooks = [block.act.register_forward_pre_hook(relu_stats.hook)]
+        if softmax_kind != "native":
+            hooks.append(block.attn.norm.register_forward_pre_hook(score_stats.hook))
+        if row_stats is not None:
+            hooks.append(block.attn.norm.register_forward_pre_hook(row_stats.hook))
         try:
             for bi, batch in enumerate(calibration_loader):
                 if max_batches is not None and bi >= max_batches:
@@ -569,17 +773,31 @@ def calibrate_npu(
             for hook in hooks:
                 hook.remove()
         gain, bias = relu_stats.coefficients()
-        low_score, high_score = score_stats.bounds(tail, margin)
         block.act = CalibratedReLU(gain, bias).to(device)
-        block.attn.norm = FixedPWLSoftmax(
-            student.n_tokens, low_score, high_score, softmax_segments, radius,
-            score_center=score_center, knot_spacing=knot_spacing,
-        ).to(device)
+        if softmax_kind == "native":
+            block.attn.norm = nn.Softmax(dim=-1)
+            if verbose:
+                print(f"  calibrated block {idx+1}/{len(student.blocks)}: ReLU only, native Softmax", flush=True)
+            continue
+        low_score, high_score = score_stats.bounds(tail, margin)
+        if softmax_kind == "mlp":
+            attn = LearnedMLPSoftmax(student.n_tokens, low_score, high_score,
+                                     hidden=mlp_hidden, score_center=score_center,
+                                     knot_spacing=knot_spacing).to(device)
+            stats = fit_mlp_softmax(attn, row_stats.get(), steps=mlp_fit_steps,
+                                    lr=mlp_fit_lr, verbose=verbose)
+            if mlp_freeze:
+                attn.freeze()
+        else:
+            attn = FixedPWLSoftmax(student.n_tokens, low_score, high_score,
+                                   softmax_segments, radius, score_center=score_center,
+                                   knot_spacing=knot_spacing).to(device)
+        block.attn.norm = attn
         if verbose:
-            print(f"  calibrated block {idx + 1}/{len(student.blocks)} "
-                  f"({score_center=}, {knot_spacing=}): "
+            print(f"  calibrated block {idx+1}/{len(student.blocks)}: "
+                  f"{softmax_kind}({mlp_hidden if softmax_kind == 'mlp' else softmax_segments}), "
                   f"ReLU gain [{float(gain.min()):.3f}, {float(gain.max()):.3f}], "
-                  f"attention head widths {(high_score - low_score).tolist()}")
+                  f"attention widths {(high_score - low_score).tolist()}", flush=True)
     return student
 
 
@@ -590,6 +808,12 @@ def convert_to_npu(
     *,
     max_batches=None,
     softmax_segments=12,
+    softmax_kind="mlp",
+    mlp_hidden=6,
+    mlp_fit_steps=150,
+    mlp_fit_lr=0.0003,
+    mlp_rows=1536,
+    mlp_freeze=False,
     tail=0.001,
     margin=0.05,
     norm_mode=None,
@@ -597,13 +821,14 @@ def convert_to_npu(
     knot_spacing="geometric",
     verbose=True,
 ):
-    """Weight transfer + norm conversion + GELU->ReLU + PWL Softmax."""
-    student = fit_static_norms(
-        teacher, calibration_loader, max_batches=max_batches, norm_mode=norm_mode
-    )
+    """Transfer teacher weights, preserve RMSNorm, calibrate ReLU/Softmax."""
+    student = fit_static_norms(teacher, calibration_loader, max_batches=max_batches,
+                               norm_mode=norm_mode)
     return calibrate_npu(
         student, calibration_loader, max_batches=max_batches,
-        softmax_segments=softmax_segments,
+        softmax_segments=softmax_segments, softmax_kind=softmax_kind,
+        mlp_hidden=mlp_hidden, mlp_fit_steps=mlp_fit_steps,
+        mlp_fit_lr=mlp_fit_lr, mlp_rows=mlp_rows, mlp_freeze=mlp_freeze,
         tail=tail, margin=margin, score_center=score_center,
         knot_spacing=knot_spacing, verbose=verbose,
     )
@@ -616,12 +841,14 @@ def measure_saturation(student, validation_loader, max_batches=None):
     data = {}
     handles = []
     for i, block in enumerate(student.blocks):
-        if not isinstance(block.attn.norm, FixedPWLSoftmax) or not isinstance(block.act, CalibratedReLU):
+        if not isinstance(block.attn.norm, (FixedPWLSoftmax, LearnedMLPSoftmax, nn.Softmax)) or not isinstance(block.act, CalibratedReLU):
             raise ValueError("Model has not been fully calibrated")
         data[i] = {"attn_count": torch.zeros(block.attn.heads, dtype=torch.float64),
                    "attn_total": 0, "relu_sqerr": 0.0, "relu_total": 0}
 
         def score_hook(module, args, i=i):
+            if isinstance(module, nn.Softmax):
+                return
             x = module.center_scores(args[0])
             count = ((x < module.low) | (x > module.high)).sum(dim=(0, 2, 3))
             data[i]["attn_count"] += count.detach().double().cpu()
@@ -633,7 +860,8 @@ def measure_saturation(student, validation_loader, max_batches=None):
             data[i]["relu_sqerr"] += float(error.square().sum().item())
             data[i]["relu_total"] += error.numel()
 
-        handles.append(block.attn.norm.register_forward_pre_hook(score_hook))
+        if not isinstance(block.attn.norm, nn.Softmax):
+            handles.append(block.attn.norm.register_forward_pre_hook(score_hook))
         handles.append(block.act.register_forward_hook(relu_hook))
     try:
         for bi, batch in enumerate(validation_loader):
@@ -643,10 +871,11 @@ def measure_saturation(student, validation_loader, max_batches=None):
     finally:
         for handle in handles:
             handle.remove()
-    if not data or not all(d["attn_total"] for d in data.values()):
+    if not data or not all(d["relu_total"] for d in data.values()):
         raise ValueError("No validation batches")
     return {
-        i: {"attention_per_head": (stats["attn_count"] / stats["attn_total"]).tolist(),
+        i: {"attention_per_head": ((stats["attn_count"] / stats["attn_total"]).tolist()
+                                   if stats["attn_total"] else None),
             "relu_vs_gelu_mse": stats["relu_sqerr"] / stats["relu_total"]}
         for i, stats in data.items()
     }
@@ -658,7 +887,7 @@ def fold_affine_norms(student: NPUViT):
 
     MatMulLayerNorm, MatMulRMSNorm and MatMulHeadRMSNorm remain dynamic.
     """
-    if any(not isinstance(b.attn.norm, FixedPWLSoftmax) or
+    if any(not isinstance(b.attn.norm, (FixedPWLSoftmax, LearnedMLPSoftmax, nn.Softmax)) or
            not isinstance(b.act, CalibratedReLU) for b in student.blocks):
         raise ValueError("Calibrate all ReLU and attention layers before folding")
     m = copy.deepcopy(student).eval()
@@ -713,7 +942,7 @@ def export_onnx(model, path):
     return str(path)
 
 
-def audit_onnx(path):
+def audit_onnx(path, allow_native_softmax=False):
     import onnx
     ops = collections.Counter(node.op_type for node in onnx.load(str(path)).graph.node)
     print(f"\nExported ONNX operators in {path}:")
@@ -721,6 +950,8 @@ def audit_onnx(path):
         note = "listed XINT8" if op in XINT8_LISTED else "confirm NPU support"
         print(f"  {op:20s} {count:4d}   {note}")
     forbidden = {"LayerNormalization", "Softmax", "Exp", "BatchNormalization", "Gelu", "Erf"}
+    if allow_native_softmax:
+        forbidden.remove("Softmax")
     if ops.keys() & forbidden:
         raise AssertionError(f"Unexpected ops in exported NPU graph: {ops.keys() & forbidden}")
     return ops
@@ -734,7 +965,9 @@ def selftest():
     patches = patchify(images, 8)
     teacher.eval()
     calib = [images[:3], images[2:]]
-    student = convert_to_npu(teacher, calib, softmax_segments=12, score_center="mean", knot_spacing="geometric")
+    student = convert_to_npu(teacher, calib, softmax_kind="mlp", mlp_hidden=6,
+                             mlp_fit_steps=15, mlp_rows=64, score_center="mean",
+                             knot_spacing="geometric")
     original = teacher(patches)
     adapted = student(patches)
     folded = fold_affine_norms(student)(patches)
@@ -745,16 +978,18 @@ def selftest():
     for block in student.blocks:
         assert not any(isinstance(m, nn.LayerNorm) for m in block.modules())
         assert isinstance(block.act, CalibratedReLU)
-        assert isinstance(block.attn.norm, FixedPWLSoftmax)
+        assert isinstance(block.attn.norm, LearnedMLPSoftmax)
+        assert block.attn.norm.hidden == 6
         test_s = torch.randn(2, block.attn.heads, student.n_tokens, student.n_tokens)
         a = block.attn.norm(test_s)
         assert torch.isfinite(a).all()
         assert torch.allclose(a.sum(-1), torch.ones_like(a.sum(-1)), atol=1e-5)
         assert not any(p.requires_grad for p in block.act.parameters())
-        assert not any(p.requires_grad for p in block.attn.norm.parameters())
+        assert any(p.requires_grad for p in block.attn.norm.parameters())
     print("held-out saturation:", measure_saturation(student, calib))
     # A refresh must be repeatable after fine-tuning.
-    calibrate_npu(student, calib, verbose=False)
+    calibrate_npu(student, calib, softmax_kind="mlp", mlp_fit_steps=10,
+                  mlp_rows=64, verbose=False)
     assert all(isinstance(b.act, nn.ReLU) for b in fold_affine_norms(student).blocks)
     print("model self-test: OK")
 

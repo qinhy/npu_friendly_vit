@@ -26,7 +26,7 @@ def test_quantize_ort_cpu_cli(tmp_path):
     ort = pytest.importorskip("onnxruntime")
     teacher = StandardViT(patch=8, dim=32, depth=1, heads=4).eval()
     calibration_images = [torch.randn(4, 3, 32, 32)]
-    student = convert_to_npu(teacher, calibration_images, softmax_segments=8, verbose=False)
+    student = convert_to_npu(teacher, calibration_images, softmax_kind="mlp", mlp_fit_steps=5, mlp_rows=64, verbose=False)
     src = tmp_path / "vit_npu.onnx"
     export_onnx(student, src)
     rng = np.random.default_rng(7)

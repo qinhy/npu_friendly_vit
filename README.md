@@ -1,57 +1,114 @@
-# RMSNorm + QK-Norm ViT for Ryzen AI experiments
+# RMSNorm + QK-Norm ViT — learned six-neuron Softmax for Ryzen AI
 
-Train a conventional transformer first, then calibrate and distill into a graph
-with ordinary ReLU and **fixed per-head PWL Softmax**. This is a PyTorch / ONNX
-research implementation, **not** a guarantee of hardware INT8 compilation.
+Train a normal floating-point ViT (`RMSNorm + QK-Norm + GELU + exact Softmax`),
+then convert it to an NPU-oriented student using **calibrated ReLU** and a
+**learned per-head six-neuron ReLU MLP in place of the Softmax exponential**.
 
-## What changed from the LayerNorm prototype
+The output is a research graph, **not** a guarantee of complete AMD XDNA1
+NPU execution. ONNX graph validation, INT8 calibration, accuracy and execution
+provider partitioning are distinct tests.
 
-| Stage | Original LayerNorm branch | New default architecture |
-| --- | --- | --- |
-| FP32 teacher normalization | `LayerNorm` | **RMSNorm** over embedding channels |
-| Query / Key | unnormalized Q and K | **per-head QK-Norm** (separate Q and K RMSNorm) |
-| Teacher activation | GELU | GELU |
-| Teacher attention | exact Softmax | exact Softmax |
-| Student normalization | MatMul-LayerNorm / static affine | **MatMul-RMSNorm** + **MatMul QK-Norm** |
-| Student activation | calibrated ReLU | calibrated ReLU; gain/bias folded into `fc2` |
-| Student attention | calibrated PWL | fixed per-head geometric-knot PWL |
-| Score centering | none / mean / max | **mean (default)**; max optional for accuracy |
+## Design
 
-**Important:** RMSNorm and QK-Norm must be learned by a fresh FP32 training
-run. Your old `out/vit_teacher.pt` contains a **LayerNorm teacher** and cannot
-be relabeled or converted into a trained RMSNorm + QK-Norm teacher. The loader
-recognizes legacy checkpoints, keeping them in the LN comparison branch.
+| Component | FP32 teacher | NPU-oriented student |
+|---|---|---|
+| Token normalization | RMSNorm | equivalent constant-MatMul RMSNorm |
+| Query and Key | per-head RMSNorm | equivalent constant-MatMul QK-Norm |
+| Activation | GELU | calibrated `gain * ReLU + bias`; gain/bias folded into `fc2` |
+| Attention scores | `Q @ K.T / sqrt(d)` | unchanged |
+| Attention normalization | exact Softmax | **learned six-neuron ReLU MLP + sum/division** (default) |
+| Other attention choices | — | fixed 12-segment PWL (`pwl`) or native Softmax (`native`) |
+| Row centering | internal to Softmax | mean via constant MatMul (default), optional max/none |
 
-## Architecture
+### Learned six-neuron MLP
 
-Teacher: `patchify -> Linear -> [RMSNorm -> QK-Norm attention with
-Softmax -> residual -> RMSNorm -> GELU MLP -> residual] x depth -> RMSNorm ->
-mean pool -> classifier`.
-
-Student: same learned projections and normalized Q/K, but reductions are
-expressed via constant MatMul; GELU is calibrated into `gain * ReLU(x) + bias`
-and gain/bias fold into `fc2`; Softmax uses fixed per-head PWL coefficients and
-sum normalization via constant MatMul + Div.
-
-For a tensor `x: [B,N,C]`, RMSNorm is:
+For each head `h`, fit a scalar-output ReLU network:
 
 ```
-x * gamma / sqrt( (x*x) @ ones(C,1)/C + eps )
+f_h(z) = base_h + sum_{i=1}^6 coef_{h,i} * ReLU(z + bias_{h,i})
+p_h(z_j) = max(f_h(z_j), eps) / sum_k max(f_h(z_k), eps)
+z = scores - row_mean(scores)                    # the default
 ```
 
-QK-Norm applies the same idea to `Q,K: [B,H,N,D]` with **separate trainable
-per-head `[H,D]` gains** before the score product. Q/K gains remain learnable
-in the student; the calibration coefficients for ReLU/PWL are frozen.
+The input weight of each ReLU neuron is constrained to `+1` to reduce NPU
+arithmetic. **The six hidden biases (knot positions), six output coefficients
+and output bias ARE learned** per head: **13 parameters per head**, or 312
+across 6 blocks × 4 heads. This is a constrained `1 → 6 → 1` ReLU MLP, and
+is a learned continuous PWL function. It deliberately does not use a
+full unconstrained `Linear(1, 6)` layer: that would require six additional
+per-score input multiplications. A row-wise sum and division are still
+required, just as with ordinary Softmax.
 
-**Hardware note:** MatMul-RMSNorm still uses `Sqrt`, `Div`, `Mul`, and the
-constant reduction `MatMul`. They may be executed as NPU or CPU ops depending
-on your quantizer/compiler and partitioning. This model removes the *native*
-LayerNormalization, GELU and Softmax ONNX operators, but doesn't eliminate
-dynamic RMS normalization.
+Each head is initialized from a six-segment geometric interpolation of
+`exp(score - calibrated_high)`, then fitted by minimizing the **KL divergence
+between exact Softmax and MLP probabilities over *real calibration attention
+rows***. Score rows come from the student as preceding layers are converted,
+and the target is exact Softmax **on those same rows**; afterward, full-model
+teacher distillation helps recover classification accuracy. The fitting loop
+retains its lowest held-out-calibration-row KL parameters. Coefficients are
+learnable during global fine-tuning by default, or can be held fixed with
+`--mlp-freeze-after-fit`.
 
-## Install
+**Inference does not calculate exponential or row-wise max** when using
+`--softmax-kind mlp --score-center mean`. The exported ONNX model uses basic
+`Add`, `Sub`, `Mul`, `Relu`, `Max`, `Min`, `MatMul`, `Div`, etc. It still has
+`Sqrt`/`Div` in the dynamic RMSNorm/QK-Norm decomposition. Verify the actual
+NPU/CPU partitioning rather than assuming speed gains.
 
-Requirements: Python 3.10–3.13, PyTorch and NumPy. Use `uv` for convenience:
+## Vectorized inference (no per-neuron `for` loop)
+
+The previous implementation constructed six separate ReLU branches in a Python
+`for` loop. This release packs each head's six learned biases and coefficients
+into `[1,H,1,6]` and `[1,H,6,1]` tensors, respectively. A **single batched
+MatMul** evaluates the six hidden-unit outputs:
+
+```python
+# scores: [B, H, Q, K]
+z = self.center_scores(scores)
+z = torch.minimum(torch.maximum(z, self.low), self.high)
+b, h, q, k = z.shape
+hidden = torch.relu(z.reshape(b, h, q * k, 1) + self.biases)
+values = (self.base + hidden @ self.coefs).reshape(b, h, q, k)
+e = torch.maximum(values, self.min_value)
+return e / (e @ self.ones)
+```
+
+There is **one hidden-layer ReLU** and **one projection MatMul** for all six
+neurons, followed by row normalization. There is no loop in `forward`. The
+fixed PWL implementation is vectorized the same way. Training/calibration
+loops still exist because gradient updates and dataset iteration are inherently
+iterative.
+
+The six-neuron learned function, parameters per head, and per-head calibration
+are unchanged; floating-point reduction order may cause very small numerical
+differences. This reduces explicit inference graph nodes but **does not prove
+lower XDNA1 latency**. In particular, verify that the 4D batched MatMul is
+assigned to the NPU after INT8 quantization.
+
+### Reuse previous checkpoints without retraining
+
+Old `vit_npu.pt` and `vit_npu_best.pt` files (with `biases.0`/`coefs.0` etc.)
+are automatically upgraded when loading, without changing their learned values.
+Legacy `vit_npu_latest.pt` AdamW moments are also migrated for
+`--resume-finetune`. To export a previously adapted model using the vectorized
+inference graph:
+
+```bash
+uv run npu-vit-train --stage export \
+  --student-ckpt out_mlp6/vit_npu.pt \
+  --out out_mlp6_vectorized
+
+uv run npu-vit-quantize \
+  --model out_mlp6_vectorized/vit_npu.onnx \
+  --data out_mlp6 --quantizer ort --npu off
+```
+
+The original `out_mlp6/` retains your preprocessing arrays; no calibration or
+fine-tuning is required for this *representation-only* conversion.
+
+## Installation
+
+Requires Python 3.10–3.13; the core package needs PyTorch and NumPy.
 
 ```bash
 uv sync --extra train --extra export --extra test
@@ -59,114 +116,140 @@ uv run pytest -q
 uv run npu-vit-selftest
 ```
 
-For CPU-only tests without downloading CIFAR-10:
+## Stage 1 — Train the normal teacher (once)
 
 ```bash
-uv run npu-vit-train --stage all --fake-data --epochs 1 \
-  --finetune-epochs 1 --dim 32 --depth 1 --patch 8 \
-  --heads 4 --batch 16 --workers 0 --fake-samples 64 \
-  --val-samples 8 --calib-samples 32 --out smoke
+uv run npu-vit-train --stage train \
+  --norm-type rms --qk-norm \
+  --epochs 100 --out out_rms_qk
 ```
 
-`--fake-data` checks the pipeline only; its accuracy is not meaningful.
+Output: `out_rms_qk/vit_teacher.pt`. You can **reuse your already trained
+RMSNorm + QK-Norm checkpoint**, so you do not need to train the teacher again.
+An older LayerNorm-only teacher is loaded as a legacy LN model, not silently
+reinterpreted as RMSNorm.
 
-## Train the new RMSNorm + QK-Norm teacher
-
-```bash
-uv run npu-vit-train --stage train --epochs 100 \
-  --norm-type rms --qk-norm --out out_rms_qk
-```
-
-This trains `RMSNorm + QK-Norm + GELU + exact Softmax`, then saves
-`out_rms_qk/vit_teacher.pt`.
-
-## Calibrate and fine-tune the NPU student
+## Stage 2 — Fit six-neuron MLP attention and fine-tune
 
 ```bash
 uv run npu-vit-train --stage adapt \
   --teacher-ckpt out_rms_qk/vit_teacher.pt \
-  --out out_rms_qk \
+  --out out_mlp6 \
   --norm-mode rms_matmul \
-  --score-center mean \
-  --knot-spacing geometric \
-  --softmax-segments 12 \
+  --softmax-kind mlp --mlp-hidden 6 \
+  --mlp-fit-steps 150 --mlp-fit-lr 0.0003 --mlp-rows 1536 \
+  --score-center mean --knot-spacing geometric \
   --finetune-epochs 10
 ```
 
-Conversion steps:
+Conversion is blockwise: preserve RMSNorm/QK-Norm math; calibrate ReLU from
+GELU preactivations; collect real attention score rows; initialize and learn
+six-neuron ReLU coefficients against exact Softmax; then adapt the entire
+student with cross-entropy, teacher-logit KL and optional block-feature MSE.
 
-1. Copy teacher parameters into the student **without changing RMSNorm/QK-Norm
-   mathematics**; their reductions are expressed through constant MatMul.
-2. Observe per-channel GELU inputs; regress `GELU(x)` against `ReLU(x)` to
-   obtain frozen per-channel gain and bias.
-3. Observe attention scores *after QK-Norm* on calibration data, with the
-   selected centering; fit per-head fixed PWL exponential coefficients.
-4. Fine-tune using ground-truth cross-entropy and teacher-logit/feature KD.
-5. Recalibrate PWL and ReLU coefficients after fine-tuning; **restore the
-   previous coefficients if validation accuracy deteriorates**.
-6. Save `vit_npu.pt`, `calib.npy`, `test_x.npy`, `test_y.npy`, and, when ONNX
-   is installed, `vit_npu.onnx`.
+The PWL/MLP coefficients may change during the final fine-tuning stage.
+After fine-tuning, the code tries refreshed ReLU/MLP calibration and keeps
+**the better of the pre-refresh and refreshed validation accuracy**.
 
-To favor accuracy when mean-centering underperforms, repeat the adaptation with:
+If you want to freeze the learned MLP during full-model fine-tuning, add
+`--mlp-freeze-after-fit`.
+
+### Checkpoint saving / resuming
+
+- `out_mlp6/vit_npu_best.pt` — best student before final refresh.
+- `out_mlp6/vit_npu_latest.pt` — saved after each epoch with optimizer,
+  completed epoch, best accuracy and RNG state. Also saved at epoch 0.
+- `out_mlp6/vit_npu.pt` — best final model after optional coefficient refresh.
+
+Resume using the **same output folder and configuration**:
 
 ```bash
 uv run npu-vit-train --stage adapt \
-  --teacher-ckpt out_rms_qk/vit_teacher.pt --out out_rms_qk_max \
-  --score-center max --knot-spacing geometric \
-  --softmax-segments 12 --finetune-epochs 10
+  --teacher-ckpt out_rms_qk/vit_teacher.pt \
+  --out out_mlp6 --resume-finetune \
+  --softmax-kind mlp --mlp-hidden 6 \
+  --score-center mean --knot-spacing geometric \
+  --finetune-epochs 10
 ```
 
-**Default `mean` score centering** computes a row-wise mean using a fixed
-MatMul, rather than row-wise `ReduceMax`. Exact Softmax is shift invariant,
-but clipped/approximated PWL is imperfect. The `max` fallback inserts a
-`ReduceMax`; compare actual NPU partitioning and validation accuracy.
+`--finetune-epochs` is the total target, not additional epochs. Recovery is
+at epoch boundaries, and a running process cannot pick up source edits until
+restarted.
 
-Calibrated bounds are quantiles, not guaranteed extrema. Validate held-out
-out-of-range rates and classifier accuracy. Segments/placement are not yet
-optimized for any specific NPU compiler.
-
-## Export and quantize
+## Stage 3 — Export and quantize
 
 ```bash
-uv run npu-vit-train --stage export --out out_rms_qk
-uv run npu-vit-quantize --model out_rms_qk/vit_npu.onnx \
-  --data out_rms_qk --quantizer ort --npu off
+uv run npu-vit-train --stage export --out out_mlp6
+
+uv run npu-vit-quantize --model out_mlp6/vit_npu.onnx \
+  --data out_mlp6 --quantizer ort --npu off
 ```
 
-On a properly installed AMD Ryzen AI machine, use your matching Quark release:
+`calib.npy`, `test_x.npy`, and `test_y.npy` are produced **at the beginning of
+`--stage adapt`**, before lengthy calibration/fine-tuning, and reproduced at
+completion. If they are missing, generate them *without any retraining*:
 
 ```bash
-uv run npu-vit-quantize --model out_rms_qk/vit_npu.onnx \
-  --data out_rms_qk --quantizer quark --config XINT8 --npu require
+uv run npu-vit-train --stage data \
+  --teacher-ckpt out_rms_qk/vit_teacher.pt --out out_mlp6
 ```
 
-The portable ORT INT8 path does **not** prove Ryzen AI `XINT8` support. Check
-ONNX ops, compiler logs, NPU/CPU partitions, accuracy and latency.
-
-## Compare against earlier architectures
+Keep the same data split/preprocessing and input patch size. By default the
+calibration array is an unaugmented subset of CIFAR-10 training images.
+For quantization on AMD hardware, use a compatible Quark/Ryzen AI environment:
 
 ```bash
-# Legacy LayerNorm + no QK-Norm, with dynamic MatMul-LayerNorm
-uv run npu-vit-train --stage train --norm-type ln --no-qk-norm \
-  --epochs 100 --out out_ln
-uv run npu-vit-train --stage adapt --teacher-ckpt out_ln/vit_teacher.pt \
-  --norm-mode matmul --score-center max --out out_ln
-
-# RMSNorm without QK-Norm (ablation)
-uv run npu-vit-train --stage train --norm-type rms --no-qk-norm \
-  --epochs 100 --out out_rms_only
+uv run npu-vit-quantize --model out_mlp6/vit_npu.onnx \
+  --data out_mlp6 --quantizer quark --config XINT8 --npu require
 ```
 
-An old LN checkpoint (without `norm_type` metadata) can still be loaded for
-legacy comparisons; it is **never silently turned into RMSNorm/QK-Norm**.
+The ORT INT8 CPU path is *not* proof of Ryzen AI NPU compatibility or speed.
 
-## Files
+## Controlled comparisons: keep the teacher fixed
+
+**Fixed 12-segment PWL**, to compare with the learned six-neuron MLP:
+
+```bash
+uv run npu-vit-train --stage adapt \
+  --teacher-ckpt out_rms_qk/vit_teacher.pt --out out_pwl12 \
+  --softmax-kind pwl --softmax-segments 12 \
+  --score-center mean --knot-spacing geometric --finetune-epochs 10
+```
+
+**Native Softmax**, as the hardware/compiler reference (exports a native
+`Softmax` node; does NOT try to eliminate it):
+
+```bash
+uv run npu-vit-train --stage adapt \
+  --teacher-ckpt out_rms_qk/vit_teacher.pt --out out_native \
+  --softmax-kind native --finetune-epochs 10
+```
+
+Compare all three on the same validation/test split: teacher/student accuracy,
+attention KL, clipped-score rates, post-quantization accuracy, median batch-1
+latency, and NPU vs CPU assignment. A learned six-neuron model is **not
+necessarily** faster or more accurate than an optimized native Softmax.
+
+## Quick smoke tests (no dataset downloads)
+
+```bash
+uv run npu-vit-train --stage all --fake-data \
+  --epochs 1 --finetune-epochs 1 --dim 32 --depth 1 --patch 8 \
+  --heads 4 --batch 16 --workers 0 --fake-samples 64 \
+  --val-samples 8 --calib-samples 32 --mlp-fit-steps 10 --mlp-rows 64 \
+  --out smoke
+```
+
+This validates the pipeline, but **fake-data accuracy has no meaning**.
+
+## Repo contents
 
 ```
 src/npu_friendly_vit/
-  model.py       teacher/student layers, calibration, folding, ONNX auditing
-  train.py       CIFAR-10 training, adaptation and KD CLI
-  quantize.py    ORT INT8 + AMD Quark NPU CLI
+  __init__.py
+  model.py        teacher/student, six-neuron ReLU MLP, calibration, folding, ONNX
+  train.py        FP32 training, conversion, learned fitting, distillation, checkpoints
+  quantize.py     ONNX Runtime INT8 / AMD Quark quantization and evaluation
 tests/
   test_model.py
   test_train.py
@@ -174,12 +257,9 @@ tests/
 pyproject.toml
 ```
 
-## Testing status
-
-Run `uv run pytest -q`. PyTorch tests verify exact FP32 RMSNorm/QK-Norm transfer,
-PWL normalization, ReLU folding, checkpoint reload, and a fake-data train/adapt
-smoke test. ONNX/ORT checks require optional `onnx` and `onnxruntime` packages.
-
-No real CIFAR-10 benchmark or Ryzen AI NPU execution is claimed for this new
-RMSNorm + QK-Norm branch. Earlier LayerNorm checkpoints/accuracy are not
-comparable until both branches are trained and evaluated on the same split.
+The test suite checks RMSNorm and QK-Norm equivalence, learned-MLP
+probability normalization and fitting, old fixed-PWL and native branches,
+ReLU folding, checkpoint persistence/resume, and smoke training. Optional
+`onnx` and `onnxruntime` are required to validate the actual ONNX graph;
+without them those tests skip. We have not measured real CIFAR-10 or NPU
+inference results for the learned-MLP student.

@@ -9,9 +9,10 @@ Or run alongside model.py:
 
 Stages:
   train   : train RMSNorm/QK-Norm ViT with GELU/Softmax, save teacher
-  adapt   : load teacher, retain RMSNorm/QK-Norm via MatMul, calibrate ReLU/PWL, distill,
+  adapt   : load teacher, retain RMSNorm/QK-Norm via MatMul, calibrate ReLU/MLP Softmax, distill,
             recalibrate, save NPU checkpoint/ONNX and test arrays
   export  : load already adapted NPU checkpoint and export ONNX
+  data    : generate calib.npy/test_x.npy/test_y.npy without training
   all     : train + adapt (default)
 
 Important: final ONNX is still floating point. INT8 quantization is a separate
@@ -19,6 +20,7 @@ Ryzen AI / Vitis AI calibration step using the generated calib.npy.
 """
 
 import argparse
+import copy
 import math
 import os
 import tempfile
@@ -33,13 +35,13 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 
 if __package__:
     from .model import (
-        StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax,
+        StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax,
         convert_to_npu, calibrate_npu, measure_saturation,
         audit_onnx, export_onnx, patchify, patchify_np,
     )
 else:
     from model import (
-        StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax,
+        StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax,
         convert_to_npu, calibrate_npu, measure_saturation,
         audit_onnx, export_onnx, patchify, patchify_np,
     )
@@ -161,14 +163,31 @@ def load_teacher(path, device):
 
 
 def _student_pwl_specs(model):
-    return [dict(
-        relu_gain=b.act.gain.detach().cpu(), relu_bias=b.act.bias.detach().cpu(),
-        score_low=b.attn.norm.low.detach().reshape(-1).cpu(),
-        score_high=b.attn.norm.high.detach().reshape(-1).cpu(),
-        softmax_segments=b.attn.norm.segments,
-        score_center=b.attn.norm.score_center,
-        knot_spacing=b.attn.norm.knot_spacing,
-    ) for b in model.blocks]
+    """Serialize network topology separately from weights, backward compatible."""
+    specs = []
+    for b in model.blocks:
+        attn = b.attn.norm
+        spec = dict(relu_gain=b.act.gain.detach().cpu(),
+                    relu_bias=b.act.bias.detach().cpu())
+        if isinstance(attn, LearnedMLPSoftmax):
+            spec.update(attn_kind="mlp", mlp_hidden=attn.hidden,
+                        score_low=attn.low.detach().reshape(-1).cpu(),
+                        score_high=attn.high.detach().reshape(-1).cpu(),
+                        score_center=attn.score_center,
+                        knot_spacing=attn.knot_spacing,
+                        mlp_trainable=any(p.requires_grad for p in attn.parameters()))
+        elif isinstance(attn, FixedPWLSoftmax):
+            spec.update(attn_kind="pwl", softmax_segments=attn.segments,
+                        score_low=attn.low.detach().reshape(-1).cpu(),
+                        score_high=attn.high.detach().reshape(-1).cpu(),
+                        score_center=attn.score_center,
+                        knot_spacing=attn.knot_spacing)
+        elif isinstance(attn, nn.Softmax):
+            spec.update(attn_kind="native")
+        else:
+            raise TypeError(f"Student attention is not calibrated: {type(attn)}")
+        specs.append(spec)
+    return specs
 
 
 def _atomic_torch_save(payload, path):
@@ -201,16 +220,105 @@ def load_student(path, device):
     if "norm_type" not in cfg:
         cfg.update(norm_type="ln", qk_norm=False)
     model = NPUViT(**cfg, norm_mode=ckpt.get("norm_mode", "affine"))
+    if len(ckpt["pwl_specs"]) != len(model.blocks):
+        raise ValueError("Checkpoint attention specifications have wrong block count")
     for b, spec in zip(model.blocks, ckpt["pwl_specs"]):
         b.act = CalibratedReLU(spec["relu_gain"], spec["relu_bias"])
-        b.attn.norm = FixedPWLSoftmax(
-            model.n_tokens, spec["score_low"], spec["score_high"],
-            spec["softmax_segments"],
-            score_center=spec.get("score_center", "none"),
-            knot_spacing=spec.get("knot_spacing", "uniform"),
-        )
+        kind = spec.get("attn_kind", "pwl")  # legacy fixed-PWL checkpoints
+        if kind == "mlp":
+            b.attn.norm = LearnedMLPSoftmax(
+                model.n_tokens, spec["score_low"], spec["score_high"],
+                hidden=spec["mlp_hidden"],
+                score_center=spec.get("score_center", "mean"),
+                knot_spacing=spec.get("knot_spacing", "geometric"),
+            )
+            if not spec.get("mlp_trainable", True):
+                b.attn.norm.freeze()
+        elif kind == "pwl":
+            b.attn.norm = FixedPWLSoftmax(
+                model.n_tokens, spec["score_low"], spec["score_high"],
+                spec["softmax_segments"],
+                score_center=spec.get("score_center", "none"),
+                knot_spacing=spec.get("knot_spacing", "uniform"),
+            )
+        elif kind == "native":
+            b.attn.norm = nn.Softmax(dim=-1)
+        else:
+            raise ValueError(f"Unknown attention kind in checkpoint: {kind}")
     model.load_state_dict(ckpt["model"])
     return model.to(device).eval()
+
+
+def _load_optimizer_compat(opt, saved_optimizer, student):
+    """Resume older per-neuron-ParameterList AdamW states after vectorization.
+
+    Existing `vit_npu_latest.pt` files contain one parameter and optimizer slot
+    per hidden unit. Our vectorized implementation packs them per head into two
+    matrices; the Adam first/second moments can be concatenated exactly.
+    No changes to the checkpoint are written by this helper.
+    """
+    new = opt.state_dict()
+    if len(new["param_groups"]) != 1 or len(saved_optimizer["param_groups"]) != 1:
+        # This training script uses a single group; do not guess multi-group mappings.
+        opt.load_state_dict(saved_optimizer)
+        return False
+    old_ids = saved_optimizer["param_groups"][0]["params"]
+    new_ids = new["param_groups"][0]["params"]
+    if len(old_ids) == len(new_ids):
+        opt.load_state_dict(saved_optimizer)
+        return False
+
+    names = [name for name, _ in student.named_parameters()]
+    if len(names) != len(new_ids):
+        raise ValueError("Current optimizer/model parameter counts do not match")
+    old_names = []
+    for name in names:
+        if name.endswith((".attn.norm.biases", ".attn.norm.coefs")):
+            path = name.rsplit(".", 1)[0]
+            mod = student.get_submodule(path)
+            if isinstance(mod, LearnedMLPSoftmax):
+                old_names.extend(f"{name}.{i}" for i in range(mod.hidden))
+                continue
+        old_names.append(name)
+    if len(old_names) != len(old_ids):
+        raise ValueError(
+            "Cannot restore optimizer: parameter layout does not match the old "
+            "or new MLP format. Use vit_npu_best.pt for model-only recovery."
+        )
+
+    old_by_name = dict(zip(old_names, old_ids))
+    migrated_state = {}
+    for name, new_id in zip(names, new_ids):
+        if name in old_by_name:
+            slot = saved_optimizer["state"].get(old_by_name[name])
+            if slot:
+                migrated_state[new_id] = copy.deepcopy(slot)
+            continue
+        path = name.rsplit(".", 1)[0]
+        mod = student.get_submodule(path)
+        if not isinstance(mod, LearnedMLPSoftmax):
+            raise ValueError(f"Cannot migrate optimizer parameter {name}")
+        slots = [saved_optimizer["state"].get(old_by_name[f"{name}.{i}"])
+                 for i in range(mod.hidden)]
+        if all(not slot for slot in slots):
+            continue  # Frozen parameters have no optimizer moments.
+        if any(not slot for slot in slots):
+            raise ValueError(f"Partial legacy Adam state for {name}")
+        migrated = {}
+        for key in slots[0]:
+            vals = [slot[key] for slot in slots]
+            if isinstance(vals[0], torch.Tensor) and vals[0].ndim > 0:
+                if name.endswith(".biases"):
+                    migrated[key] = torch.cat(vals, dim=-1)
+                else:
+                    migrated[key] = torch.cat(vals, dim=-1).transpose(-1, -2).contiguous()
+            else:
+                migrated[key] = copy.deepcopy(vals[0])
+        migrated_state[new_id] = migrated
+    migrated_groups = copy.deepcopy(saved_optimizer["param_groups"])
+    migrated_groups[0]["params"] = new_ids
+    opt.load_state_dict({"state": migrated_state, "param_groups": migrated_groups})
+    return True
 
 
 def finetune_student(student, teacher, train_dl, val_dl, args, device):
@@ -235,7 +343,8 @@ def finetune_student(student, teacher, train_dl, val_dl, args, device):
         if checkpoint["config"] != student.config or checkpoint["norm_mode"] != student.norm_mode:
             raise ValueError("Saved fine-tuning checkpoint has an incompatible architecture")
         student.load_state_dict(checkpoint["model"])
-        opt.load_state_dict(checkpoint["optimizer"])
+        if _load_optimizer_compat(opt, checkpoint["optimizer"], student):
+            print("[NPU] Upgraded legacy MLP optimizer moments to packed matrices", flush=True)
         start_epoch = int(checkpoint["epoch"])
         best_acc = float(checkpoint["best_accuracy"])
         if "torch_rng_state" in checkpoint:
@@ -355,13 +464,13 @@ def do_export(model, args):
         return
     export_onnx(model.cpu().eval(), path)
     print(f"Exported: {path}")
-    audit_onnx(path)
+    audit_onnx(path, allow_native_softmax=isinstance(model.blocks[0].attn.norm, nn.Softmax))
     # Other export failures deliberately propagate: do not silently claim success.
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--stage", choices=["all", "train", "adapt", "export"], default="all")
+    p.add_argument("--stage", choices=["all", "train", "adapt", "export", "data"], default="all")
     p.add_argument("--epochs", type=int, default=100, help="standard ViT training epochs")
     p.add_argument("--finetune-epochs", type=int, default=10,
                    help="total fine-tuning epochs, including epochs already completed when resuming")
@@ -387,6 +496,17 @@ def main(argv=None):
     p.add_argument("--calib-batches", type=int, default=None)
     p.add_argument("--calib-tail", type=float, default=0.001, help="trim fraction each tail")
     p.add_argument("--calib-margin", type=float, default=0.05)
+    p.add_argument("--softmax-kind", choices=["mlp", "pwl", "native"], default="mlp",
+                   help="mlp: learned ReLU exponential; pwl: fixed geometric hinges; native: exact Softmax")
+    p.add_argument("--mlp-hidden", type=int, default=6,
+                   help="number of per-head ReLU neurons (default 6)")
+    p.add_argument("--mlp-fit-steps", type=int, default=150,
+                   help="standalone learned MLP distillation optimization steps per block")
+    p.add_argument("--mlp-fit-lr", type=float, default=0.0003)
+    p.add_argument("--mlp-rows", type=int, default=1536,
+                   help="maximum captured attention rows per transformer block")
+    p.add_argument("--mlp-freeze-after-fit", action="store_true",
+                   help="do not train learned MLP coefficients in global student fine-tuning")
     p.add_argument("--softmax-segments", type=int, default=12)
     p.add_argument("--norm-type", choices=["rms", "ln"], default="rms",
                    help="training normalization: rms is the new default; ln is the legacy baseline")
@@ -418,6 +538,8 @@ def main(argv=None):
         p.error("Training requires --epochs >= 1")
     if a.finetune_epochs < 0:
         p.error("--finetune-epochs must be >= 0")
+    if a.mlp_hidden < 2 or a.mlp_rows < 2 or a.mlp_fit_steps < 0 or a.mlp_fit_lr <= 0:
+        p.error("Invalid learned-MLP fitting settings")
     if a.resume_finetune and a.stage != "adapt":
         p.error("--resume-finetune is only valid for --stage adapt")
     if a.norm_mode != "auto" and ((a.norm_type == "rms" and a.norm_mode != "rms_matmul") or
@@ -437,6 +559,11 @@ def main(argv=None):
         return
 
     train_dl, calib_dl, val_dl, test_dl, calib_ds, test_ds, indices = get_loaders(a)
+    if a.stage == "data":
+        patch = load_teacher(teacher_path, device).patch if teacher_path.is_file() else a.patch
+        save_quantizer_arrays(a, calib_ds, test_ds, indices, patch)
+        print(f"Calibration and evaluation arrays written to {a.out}/")
+        return
     if a.stage in {"all", "train"}:
         teacher = StandardViT(dim=a.dim, depth=a.depth, heads=a.heads,
                               patch=a.patch, mlp_ratio=a.mlp_ratio,
@@ -448,7 +575,9 @@ def main(argv=None):
         if a.stage == "train":
             return
 
+    # Save calibration arrays before lengthy fitting/fine-tuning, not afterward.
     teacher = load_teacher(teacher_path, device)
+    save_quantizer_arrays(a, calib_ds, test_ds, indices, teacher.patch)
     teacher_acc = evaluate(teacher, val_dl, device)
     norm_mode = ("rms_matmul" if teacher.norm_type == "rms" else "matmul") if a.norm_mode == "auto" else a.norm_mode
     print(f"Teacher validation ({teacher.norm_type.upper()}+QK-Norm={teacher.qk_norm}"
@@ -461,23 +590,28 @@ def main(argv=None):
         if student.config != teacher.config or student.norm_mode != norm_mode:
             raise ValueError("Teacher and resumed student architectures/norm modes differ")
         saved_attn = student.blocks[0].attn.norm
-        if (saved_attn.score_center != a.score_center or
-                saved_attn.knot_spacing != a.knot_spacing or
-                saved_attn.segments != a.softmax_segments):
-            raise ValueError(
-                "Resume PWL settings differ from checkpoint: "
-                f"saved center={saved_attn.score_center}, "
-                f"spacing={saved_attn.knot_spacing}, "
-                f"segments={saved_attn.segments}. "
-                "Supply matching --score-center, --knot-spacing and --softmax-segments."
-            )
+        saved_kind = ("mlp" if isinstance(saved_attn, LearnedMLPSoftmax)
+                      else "pwl" if isinstance(saved_attn, FixedPWLSoftmax) else "native")
+        if saved_kind != a.softmax_kind:
+            raise ValueError(f"Resume attention kind mismatch: saved {saved_kind}; requested {a.softmax_kind}")
+        if saved_kind != "native":
+            if (saved_attn.score_center != a.score_center or
+                    saved_attn.knot_spacing != a.knot_spacing):
+                raise ValueError("Resume score-center/knot-spacing differ from checkpoint")
+            if saved_kind == "mlp" and saved_attn.hidden != a.mlp_hidden:
+                raise ValueError("Resume MLP hidden width differs from checkpoint")
+            if saved_kind == "pwl" and saved_attn.segments != a.softmax_segments:
+                raise ValueError("Resume PWL segments differ from checkpoint")
         print(f"Loaded NPU student from {latest_path} without recalibrating it.")
     else:
         print(f"Converting norm={norm_mode}, GELU -> calibrated ReLU, "
-              f"attention PWL(center={a.score_center}, knots={a.knot_spacing})...")
+              f"attention {a.softmax_kind}(center={a.score_center}, knots={a.knot_spacing})...")
         student = convert_to_npu(
             teacher, calib_dl, max_batches=a.calib_batches,
-            softmax_segments=a.softmax_segments,
+            softmax_segments=a.softmax_segments, softmax_kind=a.softmax_kind,
+            mlp_hidden=a.mlp_hidden, mlp_fit_steps=a.mlp_fit_steps,
+            mlp_fit_lr=a.mlp_fit_lr, mlp_rows=a.mlp_rows,
+            mlp_freeze=a.mlp_freeze_after_fit,
             tail=a.calib_tail, margin=a.calib_margin,
             norm_mode=norm_mode, score_center=a.score_center,
             knot_spacing=a.knot_spacing,
@@ -489,7 +623,10 @@ def main(argv=None):
     pre_refresh_val = evaluate(student, val_dl, device)
     before_refresh_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
     calibrate_npu(student, calib_dl, max_batches=a.calib_batches,
-                  softmax_segments=a.softmax_segments,
+                  softmax_segments=a.softmax_segments, softmax_kind=a.softmax_kind,
+                  mlp_hidden=a.mlp_hidden, mlp_fit_steps=a.mlp_fit_steps,
+                  mlp_fit_lr=a.mlp_fit_lr, mlp_rows=a.mlp_rows,
+                  mlp_freeze=a.mlp_freeze_after_fit,
                   tail=a.calib_tail, margin=a.calib_margin,
                   score_center=a.score_center, knot_spacing=a.knot_spacing)
     refreshed_val = evaluate(student, val_dl, device)

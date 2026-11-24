@@ -6,7 +6,7 @@ import torch.nn as nn
 
 from npu_friendly_vit import (
     TokenRMSNorm, MatMulRMSNorm, HeadRMSNorm, MatMulHeadRMSNorm,
-    MatMulLayerNorm, StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax,
+    MatMulLayerNorm, StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax, fit_mlp_softmax,
     fit_static_norms, convert_to_npu, calibrate_npu, fold_affine_norms,
     export_onnx, audit_onnx, measure_saturation, patchify, patchify_np,
 )
@@ -102,7 +102,7 @@ def test_pwl_no_row_max_mean_center_and_geometric_knots():
 def test_full_conversion_fold_and_checkpoint(tmp_path):
     teacher = tiny_teacher()
     calib = calibration()
-    student = convert_to_npu(teacher, calib, softmax_segments=12,
+    student = convert_to_npu(teacher, calib, softmax_kind="pwl", softmax_segments=12,
                              score_center="mean", knot_spacing="geometric", verbose=False)
     x = patchify(calib[0], 8)
     assert isinstance(student.blocks[0].act, CalibratedReLU)
@@ -125,7 +125,7 @@ def test_full_conversion_fold_and_checkpoint(tmp_path):
     with torch.no_grad():
         torch.testing.assert_close(loaded(x), y, atol=2e-6, rtol=1e-5)
     assert len(measure_saturation(loaded, calib)) == 2
-    calibrate_npu(loaded, calib, softmax_segments=12, verbose=False)
+    calibrate_npu(loaded, calib, softmax_kind="pwl", softmax_segments=12, verbose=False)
 
 
 def test_legacy_ln_branch_and_checkpoint(tmp_path):
@@ -148,7 +148,7 @@ def test_legacy_ln_branch_and_checkpoint(tmp_path):
 
 def test_no_high_level_norm_or_softmax_in_trace():
     teacher = tiny_teacher()
-    student = convert_to_npu(teacher, calibration(), verbose=False)
+    student = convert_to_npu(teacher, calibration(), softmax_kind="pwl", verbose=False)
     folded = fold_affine_norms(student).eval()
     example = torch.randn(1, 16, 192)
     with torch.no_grad():
@@ -162,7 +162,7 @@ def test_export_onnx_and_ort_parity(tmp_path):
     pytest.importorskip("onnx")
     ort = pytest.importorskip("onnxruntime")
     teacher = tiny_teacher()
-    student = convert_to_npu(teacher, calibration(), verbose=False)
+    student = convert_to_npu(teacher, calibration(), softmax_kind="pwl", verbose=False)
     path = tmp_path / "vit.onnx"
     export_onnx(student, path)
     ops = audit_onnx(path)
@@ -176,3 +176,149 @@ def test_export_onnx_and_ort_parity(tmp_path):
         expected = student(x).numpy()
     np.testing.assert_allclose(sess.run(None, {"input": x.numpy()})[0],
                                expected, atol=4e-4, rtol=4e-4)
+
+
+def test_learned_mlp6_valid_and_fitting_improves_kl():
+    from npu_friendly_vit.model import _row_kl
+    torch.manual_seed(0)
+    module = LearnedMLPSoftmax(
+        32, torch.full((4,), -6.0), torch.full((4,), 6.0), hidden=6,
+        score_center="mean", knot_spacing="geometric",
+    )
+    assert sum(p.numel() for p in module.parameters()) == 4 * (2 * 6 + 1)
+    scores = torch.randn(512, 4, 32) * 1.8
+    stats = fit_mlp_softmax(module, scores, steps=100, lr=0.0003)
+    assert stats["best_kl"] <= stats["initial_kl"] + 1e-7
+    # Parameters should respond to an optimization objective, not just be a
+    # relabeled fixed PWL function.
+    module.train()
+    logits = torch.randn(2, 4, 8, 32)
+    probs = module(logits)
+    assert torch.isfinite(probs).all()
+    assert (probs > 0).all()
+    torch.testing.assert_close(probs.sum(-1), torch.ones(2, 4, 8), atol=1e-5, rtol=0)
+    torch.testing.assert_close(probs, module(logits + 2), atol=1e-5, rtol=1e-4)
+    _row_kl(module, scores[:16]).backward()
+    assert any(p.grad is not None for p in module.parameters())
+    module.freeze()
+    assert not any(p.requires_grad for p in module.parameters())
+
+
+def test_learned_mlp_conversion_reload_fold_trace(tmp_path):
+    teacher = tiny_teacher()
+    calib = calibration()
+    student = convert_to_npu(teacher, calib, softmax_kind="mlp", mlp_hidden=6,
+                             mlp_fit_steps=10, mlp_rows=64, verbose=False)
+    assert isinstance(student.blocks[0].attn.norm, LearnedMLPSoftmax)
+    x = patchify(calib[0], 8)
+    with torch.no_grad():
+        result = student(x)
+        folded = fold_affine_norms(student)
+        torch.testing.assert_close(folded(x), result, atol=3e-6, rtol=2e-5)
+        traced = torch.jit.trace(folded, x[:1])
+    ops = set(torch.jit.export_opnames(traced))
+    assert not any("softmax" in op or "gelu" in op or "exp" in op or "layer_norm" in op
+                   or "reduce_max" in op for op in ops)
+    path = tmp_path / "mlp.pt"
+    save_student(student, path)
+    reloaded = load_student(path, "cpu")
+    assert reloaded.blocks[0].attn.norm.hidden == 6
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(x), result, atol=2e-6, rtol=1e-5)
+    assert len(measure_saturation(reloaded, calib)) == 2
+
+
+def test_native_softmax_baseline_save_reload(tmp_path):
+    teacher = tiny_teacher()
+    student = convert_to_npu(teacher, calibration(), softmax_kind="native", verbose=False)
+    assert isinstance(student.blocks[0].attn.norm, nn.Softmax)
+    path = tmp_path / "native.pt"
+    save_student(student, path)
+    reloaded = load_student(path, "cpu")
+    assert isinstance(reloaded.blocks[0].attn.norm, nn.Softmax)
+    x = patchify(calibration()[0], 8)
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(x), student(x), atol=2e-6, rtol=1e-5)
+    assert all(v["attention_per_head"] is None for v in measure_saturation(reloaded, calibration()).values())
+
+
+def test_learned_mlp_onnx_no_exp_and_ort_parity(tmp_path):
+    pytest.importorskip("onnx")
+    ort = pytest.importorskip("onnxruntime")
+    teacher = tiny_teacher()
+    student = convert_to_npu(teacher, calibration(), softmax_kind="mlp",
+                             mlp_fit_steps=8, mlp_rows=64, verbose=False)
+    path = tmp_path / "mlp6.onnx"
+    export_onnx(student, path)
+    ops = audit_onnx(path)
+    assert not ({"Softmax", "Exp", "Gelu", "Erf", "LayerNormalization", "ReduceMax"} & set(ops))
+    assert "Relu" in ops
+    sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    x = patchify(calibration()[0][:1], 8)
+    with torch.no_grad():
+        torch_out = student(x).numpy()
+    np.testing.assert_allclose(sess.run(None, {"input": x.numpy()})[0],
+                               torch_out, atol=5e-4, rtol=5e-4)
+
+
+def _legacy_hinge_reference(module, scores):
+    """Reference for the previous sequential implementation, used only in tests."""
+    z = module.center_scores(scores)
+    z = torch.minimum(torch.maximum(z, module.low), module.high)
+    y = module.base
+    for i in range(module.hidden if isinstance(module, LearnedMLPSoftmax) else module.segments):
+        bias = module.biases[..., i:i + 1]
+        coef = module.coefs[:, :, i:i + 1, :]
+        y = y + coef * torch.relu(z + bias)
+    if isinstance(module, LearnedMLPSoftmax):
+        y = torch.maximum(y, module.min_value)
+    else:
+        y = torch.maximum(y, module.base * 0.5)
+    return y / (y @ module.ones)
+
+
+@pytest.mark.parametrize("kind", ["mlp", "pwl"])
+def test_vectorized_hinges_match_sequential_reference_and_no_loop_in_trace(kind):
+    torch.manual_seed(56)
+    low = torch.full((4,), -6.0)
+    high = torch.full((4,), 6.0)
+    m = (LearnedMLPSoftmax(16, low, high, hidden=6) if kind == "mlp"
+         else FixedPWLSoftmax(16, low, high, segments=12))
+    scores = torch.randn(2, 4, 16, 16) * 1.2
+    torch.testing.assert_close(m(scores), _legacy_hinge_reference(m, scores), atol=3e-6, rtol=2e-5)
+    with torch.no_grad():
+        traced = torch.jit.trace(m.eval(), scores)
+    # There must be one vectorized hidden-layer ReLU, not one for each neuron.
+    ops = set(torch.jit.export_opnames(traced))
+    assert "aten::relu" in ops
+    assert "aten::matmul" in ops
+    assert not any("softmax" in op or "exp" in op for op in ops)
+
+
+def test_vectorized_backward_gradients_match_reference():
+    m = LearnedMLPSoftmax(16, torch.full((4,), -6.0), torch.full((4,), 6.0), hidden=6)
+    scores = torch.randn(2, 4, 16, 16) * 1.8
+    ref = _legacy_hinge_reference(m, scores).square().sum()
+    ref_grads = torch.autograd.grad(ref, (m.base, m.biases, m.coefs))
+    new = m(scores).square().sum()
+    new_grads = torch.autograd.grad(new, (m.base, m.biases, m.coefs))
+    for a, b in zip(ref_grads, new_grads):
+        torch.testing.assert_close(a, b, atol=3e-5, rtol=4e-4)
+
+
+@pytest.mark.parametrize("kind", ["mlp", "pwl"])
+def test_old_per_neuron_weights_upgrade_to_vectorized_state_dict(kind):
+    low, high = torch.full((4,), -6.0), torch.full((4,), 6.0)
+    m = (LearnedMLPSoftmax(16, low, high, hidden=6) if kind == "mlp"
+         else FixedPWLSoftmax(16, low, high, segments=12))
+    legacy = {k: v.clone() for k, v in m.state_dict().items()}
+    packed_bias = legacy.pop("biases")
+    packed_coef = legacy.pop("coefs")
+    n = m.hidden if kind == "mlp" else m.segments
+    for i in range(n):
+        legacy[(f"biases.{i}" if kind == "mlp" else f"bias_{i}")] = packed_bias[..., i:i + 1].clone()
+        legacy[(f"coefs.{i}" if kind == "mlp" else f"coef_{i}")] = packed_coef[:, :, i:i + 1, :].clone()
+    restored = type(m)(16, low, high, **({"hidden": 6} if kind == "mlp" else {"segments": 12}))
+    restored.load_state_dict(legacy, strict=True)
+    x = torch.randn(2, 4, 16, 16)
+    torch.testing.assert_close(restored(x), m(x), atol=1e-7, rtol=1e-6)
