@@ -1,66 +1,50 @@
+"""Portable ORT quantization tests, with NPU disabled explicitly."""
+
 import numpy as np
-import onnxruntime as ort
 import pytest
 import torch
 
-from npu_friendly_vit import NPUViT, export_onnx, patchify, patchify_np
+from npu_friendly_vit import StandardViT, convert_to_npu, export_onnx, patchify_np
 from npu_friendly_vit.quantize import NpyReader, accuracy, latency_ms, main, quantize_ort
 
 
-def test_npy_reader_rewind():
-    calib = np.zeros((3, 64, 48), dtype=np.float32)
-    reader = NpyReader(calib)
-    batches = []
-    while (item := reader.get_next()) is not None:
-        batches.append(item["input"])
-    assert len(batches) == 3
-    assert batches[0].shape == (1, 64, 48)
+def test_npy_reader_rewind_and_validation():
+    arr = np.zeros((3, 16, 192), dtype=np.float32)
+    reader = NpyReader(arr)
+    assert reader.get_next()["input"].shape == (1, 16, 192)
+    assert reader.get_next() is not None
+    assert reader.get_next() is not None
+    assert reader.get_next() is None
     reader.rewind()
     assert reader.get_next() is not None
+    with pytest.raises(ValueError):
+        NpyReader(np.empty((0, 16, 192), dtype=np.float32))
 
 
-def test_quantize_ort_pipeline(tmp_path):
-    torch.manual_seed(0)
-    model = NPUViT(dim=64, depth=1, heads=4, attn="pwl")
-    model.train()
-    model(patchify(torch.randn(8, 3, 32, 32)))
-    model.eval()
-
-    src = tmp_path / "model.onnx"
-    dst = tmp_path / "model_ortint8.onnx"
-    export_onnx(model, src)
-
-    calib = patchify_np(np.random.randn(8, 3, 32, 32).astype(np.float32))
-    test_x = patchify_np(np.random.randn(10, 3, 32, 32).astype(np.float32))
-    test_y = np.random.randint(0, 10, size=(10,), dtype=np.int64)
-
-    quantize_ort(str(src), str(dst), calib)
+def test_quantize_ort_cpu_cli(tmp_path):
+    pytest.importorskip("onnx")
+    ort = pytest.importorskip("onnxruntime")
+    teacher = StandardViT(patch=8, dim=32, depth=1, heads=4).eval()
+    calibration_images = [torch.randn(4, 3, 32, 32)]
+    student = convert_to_npu(teacher, calibration_images, softmax_segments=8, verbose=False)
+    src = tmp_path / "vit_npu.onnx"
+    export_onnx(student, src)
+    rng = np.random.default_rng(7)
+    calib = patchify_np(rng.normal(size=(8, 3, 32, 32)).astype(np.float32), p=8)
+    test_x = patchify_np(rng.normal(size=(4, 3, 32, 32)).astype(np.float32), p=8)
+    test_y = np.zeros(4, dtype=np.int64)
+    np.save(tmp_path / "calib.npy", calib)
+    np.save(tmp_path / "test_x.npy", test_x)
+    np.save(tmp_path / "test_y.npy", test_y)
+    dst = tmp_path / "vit_npu_ortint8.onnx"
+    quantize_ort(src, dst, calib)
     assert dst.exists()
-
     sess = ort.InferenceSession(str(dst), providers=["CPUExecutionProvider"])
-    acc = accuracy(sess, test_x, test_y, limit=10)
-    assert 0.0 <= acc <= 1.0
-    ms = latency_ms(sess, test_x, runs=5)
-    assert ms >= 0.0
+    assert 0.0 <= accuracy(sess, test_x, test_y, 4) <= 1.0
+    assert latency_ms(sess, test_x, runs=3) >= 0
 
-
-def test_quantize_cli_ort(tmp_path):
-    torch.manual_seed(0)
-    model = NPUViT(dim=64, depth=1, heads=4, attn="pwl")
-    model.train()
-    model(patchify(torch.randn(4, 3, 32, 32)))
-    model.eval()
-
-    src = tmp_path / "model.onnx"
-    export_onnx(model, src)
-    np.save(tmp_path / "calib.npy", patchify_np(np.random.randn(4, 3, 32, 32).astype(np.float32)))
-    np.save(tmp_path / "test_x.npy", patchify_np(np.random.randn(4, 3, 32, 32).astype(np.float32)))
-    np.save(tmp_path / "test_y.npy", np.zeros(4, dtype=np.int64))
-
-    args = ["--model", str(src), "--data", str(tmp_path), "--quantizer", "ort", "--eval-n", "4"]
-    if "VitisAIExecutionProvider" not in ort.get_available_providers():
-        with pytest.raises(SystemExit):
-            main(args)
-    else:
-        main(args)
-    assert (tmp_path / "model_ortint8.onnx").exists()
+    # CPU-only execution should be successful, even without a VitisAIExecutionProvider.
+    report = main(["--model", str(src), "--data", str(tmp_path), "--quantizer", "ort",
+                   "--npu", "off", "--eval-n", "4", "--latency-runs", "3"])
+    assert report["cpu_int8_accuracy"] >= 0
+    assert report["npu"] is None

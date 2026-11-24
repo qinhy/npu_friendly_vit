@@ -1,101 +1,178 @@
+"""RMSNorm/QK-Norm conversion, calibration, folding and ONNX tests."""
 import numpy as np
-import onnxruntime as ort
 import pytest
 import torch
 import torch.nn as nn
 
 from npu_friendly_vit import (
-    NPUViT,
-    PWLSoftmax,
-    ReLUAttnNorm,
-    audit_onnx,
-    export_onnx,
-    fold_batchnorms,
-    make_attn_norm,
-    patchify,
-    patchify_np,
+    TokenRMSNorm, MatMulRMSNorm, HeadRMSNorm, MatMulHeadRMSNorm,
+    MatMulLayerNorm, StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax,
+    fit_static_norms, convert_to_npu, calibrate_npu, fold_affine_norms,
+    export_onnx, audit_onnx, measure_saturation, patchify, patchify_np,
 )
+from npu_friendly_vit.train import save_student, load_student, load_teacher
 
 
-def test_patchify_matches_numpy():
-    imgs = torch.randn(4, 3, 32, 32)
-    pt = patchify(imgs, p=4)
-    np_out = patchify_np(imgs.numpy(), p=4)
-    assert pt.shape == (4, 64, 48)
-    assert np_out.shape == (4, 64, 48)
-    assert np.allclose(pt.numpy(), np_out)
+def tiny_teacher(norm_type="rms", qk_norm=True):
+    torch.manual_seed(13)
+    return StandardViT(dim=32, depth=2, heads=4, patch=8,
+                       norm_type=norm_type, qk_norm=qk_norm).eval()
 
 
-def test_pwl_softmax_approximates_softmax():
-    torch.manual_seed(0)
-    s = torch.randn(256, 64) * 2.0
-    pwl = PWLSoftmax(64)(s)
-    exact = torch.softmax(s, dim=-1)
-    assert torch.allclose(pwl.sum(dim=-1), torch.ones(256), atol=1e-5)
-    assert (pwl - exact).abs().max() < 0.06
-    assert (pwl - exact).abs().mean() < 0.002
+def calibration():
+    torch.manual_seed(7)
+    return [torch.randn(4, 3, 32, 32), torch.randn(3, 3, 32, 32)]
 
 
-def test_make_attn_norm_variants():
-    assert isinstance(make_attn_norm("pwl", 16), PWLSoftmax)
-    pwl_learn = make_attn_norm("pwl_learn", 16)
-    assert isinstance(pwl_learn, PWLSoftmax)
-    assert isinstance(pwl_learn.bias, nn.Parameter)
-    assert isinstance(make_attn_norm("relu", 16), ReLUAttnNorm)
-    assert isinstance(make_attn_norm("softmax", 16), nn.Softmax)
+def test_patchify():
+    x = torch.randn(4, 3, 32, 32)
+    assert patchify(x, 4).shape == (4, 64, 48)
+    np.testing.assert_allclose(patchify(x).numpy(), patchify_np(x.numpy()))
     with pytest.raises(ValueError):
-        make_attn_norm("unknown", 16)
+        patchify(x, 5)
 
 
-@pytest.mark.parametrize("attn", ["pwl", "pwl_learn", "relu", "softmax"])
-def test_npu_vit_forward_shapes(attn):
-    model = NPUViT(img_size=32, patch=4, num_classes=10, dim=64, depth=2, heads=4, attn=attn)
-    patches = patchify(torch.randn(2, 3, 32, 32))
-    logits = model(patches)
-    assert logits.shape == (2, 10)
+def test_rmsnorm_math_matches_matmul():
+    torch.manual_seed(17)
+    a, b = TokenRMSNorm(32), MatMulRMSNorm(32)
+    with torch.no_grad():
+        a.weight.uniform_(0.5, 1.7)
+        b.load_state_dict(a.state_dict())
+    x = torch.randn(3, 12, 32)
+    torch.testing.assert_close(a(x), b(x), atol=1e-6, rtol=1e-5)
+    assert b.avg.shape == (32, 1)
 
 
-def test_fold_batchnorms_exact_equivalence():
-    torch.manual_seed(0)
-    model = NPUViT(dim=64, depth=2, heads=4)
-    model.train()
-    for _ in range(3):
-        model(patchify(torch.randn(8, 3, 32, 32)))
-    model.eval()
-
-    folded = fold_batchnorms(model)
-    assert isinstance(folded.patch_bn, nn.Identity)
-    assert isinstance(folded.norm, nn.Identity)
-    for blk in folded.blocks:
-        assert isinstance(blk.norm1, nn.Identity)
-        assert isinstance(blk.norm2, nn.Identity)
-        assert isinstance(blk.bn_mid, nn.Identity)
-
-    x = patchify(torch.randn(4, 3, 32, 32))
-    diff = (model(x) - folded(x)).abs().max()
-    assert diff < 1e-5
+def test_qk_norm_math_matches_matmul_and_stable():
+    torch.manual_seed(11)
+    a, b = HeadRMSNorm(4, 8), MatMulHeadRMSNorm(4, 8)
+    with torch.no_grad():
+        a.weight.uniform_(0.5, 1.3)
+        b.load_state_dict(a.state_dict())
+    x = torch.randn(2, 4, 16, 8)
+    torch.testing.assert_close(a(x), b(x), atol=1e-6, rtol=1e-5)
+    assert a(torch.zeros_like(x)).abs().max() == 0
+    assert torch.isfinite(b(torch.zeros_like(x))).all()
 
 
-def test_export_onnx_audit_and_ort_parity(tmp_path):
-    torch.manual_seed(0)
-    model = NPUViT(dim=64, depth=2, heads=4, attn="pwl")
-    model.train()
-    for _ in range(2):
-        model(patchify(torch.randn(8, 3, 32, 32)))
-    model.eval()
+def test_teacher_architecture_and_qk_gradient():
+    model = tiny_teacher()
+    block = model.blocks[0]
+    assert isinstance(block.norm1, TokenRMSNorm)
+    assert isinstance(block.attn.q_norm, HeadRMSNorm)
+    assert isinstance(block.attn.k_norm, HeadRMSNorm)
+    assert isinstance(block.act, nn.GELU)
+    assert isinstance(block.attn.norm, nn.Softmax)
+    x = patchify(torch.randn(2, 3, 32, 32), 8)
+    loss = model(x).square().mean()
+    loss.backward()
+    assert torch.isfinite(block.attn.q_norm.weight.grad).all()
+    assert torch.isfinite(block.attn.k_norm.weight.grad).all()
 
-    onnx_path = tmp_path / "model.onnx"
-    export_onnx(model, onnx_path)
-    assert onnx_path.exists()
 
-    ops = audit_onnx(onnx_path)
-    assert "Conv" not in ops
-    assert "BatchNormalization" not in ops
-    assert "Softmax" not in ops
+def test_norm_and_qk_conversion_no_calibration_error():
+    teacher = tiny_teacher()
+    student = fit_static_norms(teacher, calibration())
+    assert isinstance(student, NPUViT)
+    assert isinstance(student.norm, MatMulRMSNorm)
+    assert isinstance(student.blocks[0].attn.q_norm, MatMulHeadRMSNorm)
+    assert isinstance(student.blocks[0].attn.k_norm, MatMulHeadRMSNorm)
+    x = patchify(torch.randn(2, 3, 32, 32), 8)
+    with torch.no_grad():
+        torch.testing.assert_close(student(x), teacher(x), atol=2e-6, rtol=1e-5)
+    # Initial teacher->student RMSNorm/QK-Norm conversion must not require fitting.
+    assert student.norm_mode == "rms_matmul"
+
+
+def test_pwl_no_row_max_mean_center_and_geometric_knots():
+    low = torch.full((4,), -9.0)
+    high = torch.full((4,), 9.0)
+    module = FixedPWLSoftmax(16, low, high, 12,
+                             score_center="mean", knot_spacing="geometric")
+    scores = torch.randn(3, 4, 16, 16) * 2
+    y = module(scores)
+    assert torch.isfinite(y).all()
+    assert (y >= 0).all()
+    torch.testing.assert_close(y.sum(-1), torch.ones(3, 4, 16), atol=2e-5, rtol=0)
+    assert all(not p.requires_grad for p in module.parameters())
+    # Mean centering preserves an additive common shift unless clipped/numerical noise.
+    torch.testing.assert_close(y, module(scores + 3.0), atol=2e-5, rtol=1e-4)
+
+
+def test_full_conversion_fold_and_checkpoint(tmp_path):
+    teacher = tiny_teacher()
+    calib = calibration()
+    student = convert_to_npu(teacher, calib, softmax_segments=12,
+                             score_center="mean", knot_spacing="geometric", verbose=False)
+    x = patchify(calib[0], 8)
+    assert isinstance(student.blocks[0].act, CalibratedReLU)
+    assert isinstance(student.blocks[0].attn.norm, FixedPWLSoftmax)
+    assert isinstance(student.blocks[0].norm1, MatMulRMSNorm)
+    assert isinstance(student.blocks[0].attn.q_norm, MatMulHeadRMSNorm)
+    assert not any(isinstance(m, (nn.LayerNorm, nn.GELU)) for m in student.modules())
+    with torch.no_grad():
+        y = student(x)
+        folded = fold_affine_norms(student)
+        assert isinstance(folded.blocks[0].act, nn.ReLU)
+        assert isinstance(folded.blocks[0].norm1, MatMulRMSNorm)
+        torch.testing.assert_close(folded(x), y, atol=2e-6, rtol=1e-5)
+    p = tmp_path / "vit_npu.pt"
+    save_student(student, p)
+    loaded = load_student(p, "cpu")
+    assert loaded.norm_type == "rms"
+    assert loaded.qk_norm is True
+    assert loaded.norm_mode == "rms_matmul"
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(x), y, atol=2e-6, rtol=1e-5)
+    assert len(measure_saturation(loaded, calib)) == 2
+    calibrate_npu(loaded, calib, softmax_segments=12, verbose=False)
+
+
+def test_legacy_ln_branch_and_checkpoint(tmp_path):
+    teacher = tiny_teacher(norm_type="ln", qk_norm=False)
+    student = fit_static_norms(teacher, calibration(), norm_mode="matmul")
+    assert isinstance(student.blocks[0].norm1, MatMulLayerNorm)
+    x = patchify(torch.randn(3, 3, 32, 32), 8)
+    with torch.no_grad():
+        torch.testing.assert_close(teacher(x), student(x), atol=2e-6, rtol=1e-5)
+    # v0.2 checkpoint without norm metadata is treated as legacy LN, never RMS.
+    ckpt = tmp_path / "legacy_teacher.pt"
+    old_cfg = dict(teacher.config)
+    old_cfg.pop("norm_type")
+    old_cfg.pop("qk_norm")
+    torch.save({"config": old_cfg, "model": teacher.state_dict()}, ckpt)
+    legacy = load_teacher(ckpt, "cpu")
+    assert legacy.norm_type == "ln"
+    assert legacy.qk_norm is False
+
+
+def test_no_high_level_norm_or_softmax_in_trace():
+    teacher = tiny_teacher()
+    student = convert_to_npu(teacher, calibration(), verbose=False)
+    folded = fold_affine_norms(student).eval()
+    example = torch.randn(1, 16, 192)
+    with torch.no_grad():
+        traced = torch.jit.trace(folded, example)
+    ops = set(torch.jit.export_opnames(traced))
+    assert not any("softmax" in op or "gelu" in op or "layer_norm" in op
+                   or "reduce_max" in op for op in ops)
+
+
+def test_export_onnx_and_ort_parity(tmp_path):
+    pytest.importorskip("onnx")
+    ort = pytest.importorskip("onnxruntime")
+    teacher = tiny_teacher()
+    student = convert_to_npu(teacher, calibration(), verbose=False)
+    path = tmp_path / "vit.onnx"
+    export_onnx(student, path)
+    ops = audit_onnx(path)
+    for op in ("Softmax", "LayerNormalization", "BatchNormalization",
+               "Exp", "Gelu", "Erf", "ReduceMax"):
+        assert op not in ops
     assert "MatMul" in ops
-
-    x = patchify(torch.randn(1, 3, 32, 32))
-    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    ort_out = sess.run(None, {"input": x.numpy()})[0]
-    pt_out = model(x).detach().numpy()
-    assert np.allclose(ort_out, pt_out, atol=1e-4)
+    x = patchify(calibration()[0][:1], 8)
+    sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    with torch.no_grad():
+        expected = student(x).numpy()
+    np.testing.assert_allclose(sess.run(None, {"input": x.numpy()})[0],
+                               expected, atol=4e-4, rtol=4e-4)

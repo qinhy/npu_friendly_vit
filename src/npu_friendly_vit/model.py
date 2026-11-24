@@ -1,322 +1,762 @@
+"""Standard RMSNorm + QK-Norm ViT -> calibrated ReLU / PWL NPU ViT.
+
+Teacher trains with dynamic RMSNorm, per-head Q/K RMSNorm, GELU and Softmax.
+Student replaces RMSNorm by an equivalent MatMul decomposition, calibrates
+GELU -> affine-corrected ReLU, and uses fixed per-head PWL Softmax coefficients.
+The preceding LayerNorm (ln) architecture remains available as an ablation.
+FP32 graph suitability and real INT8 NPU partitioning are distinct checks.
 """
-model.py - a small, conv-free, NPU-friendly Vision Transformer for AMD Ryzen AI
-(Hawk Point / XDNA1, XINT8 flow).
 
-The exported graph contains only: MatMul, Add, Mul, Sub, Div, Max, ReduceMax,
-Relu, Reshape, Transpose (+ constants). No Conv, no BatchNorm, no pooling op.
-
-  * Patch embedding -> patchify outside the model (pure data rearrangement)
-                       + Linear (MatMul)
-  * LayerNorm       -> BatchNorm over channels, folded into the Linear layers at export
-  * GELU            -> ReLU
-  * Softmax         -> PWLSoftmax (ReduceMax, Sub, Max, Add, ReLU, Mul, MatMul, Div)
-  * Mean pooling    -> MatMul with a constant [1, N] vector of 1/N
-  * Tokens use [B, N, C] layout; nn.Linear on 3D input exports as MatMul + Add.
-
-Self-test:  uv run npu-vit-selftest
-"""
+from __future__ import annotations
 
 import collections
 import copy
-import os
-import tempfile
+import math
+from typing import Iterable
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-# --- Patchify (done on the CPU, before the model) -----------------------------
-def patchify(x, p=4):
-    """[B, C, H, W] torch tensor -> [B, (H/p)*(W/p), C*p*p]"""
-    B, C, H, W = x.shape
-    x = x.reshape(B, C, H // p, p, W // p, p).permute(0, 2, 4, 1, 3, 5)
-    return x.reshape(B, (H // p) * (W // p), C * p * p)
+# CPU-side patchification; exported model only receives [B,N,patch_dim] patches.
+def patchify(x: torch.Tensor, p: int = 4) -> torch.Tensor:
+    b, c, h, w = x.shape
+    if h % p or w % p:
+        raise ValueError("Image dimensions must be divisible by patch size")
+    return x.reshape(b, c, h // p, p, w // p, p).permute(0, 2, 4, 1, 3, 5).reshape(
+        b, (h // p) * (w // p), c * p * p
+    )
 
 
-def patchify_np(x, p=4):
-    """Same as patchify, for NumPy arrays (used at deployment)."""
-    B, C, H, W = x.shape
-    x = x.reshape(B, C, H // p, p, W // p, p).transpose(0, 2, 4, 1, 3, 5)
-    return np.ascontiguousarray(x.reshape(B, (H // p) * (W // p), C * p * p))
+def patchify_np(x: np.ndarray, p: int = 4) -> np.ndarray:
+    b, c, h, w = x.shape
+    if h % p or w % p:
+        raise ValueError("Image dimensions must be divisible by patch size")
+    return np.ascontiguousarray(
+        x.reshape(b, c, h // p, p, w // p, p)
+        .transpose(0, 2, 4, 1, 3, 5)
+        .reshape(b, (h // p) * (w // p), c * p * p)
+    )
 
 
-# --- Piecewise-linear exp(z) for z in [-5.5, 0] ------------------------------
-KNOTS = [5.5, 3.5, 2.5, 1.75, 1.25, 0.75, 0.35]
-COEFS = [0.0129, 0.0385, 0.0702, 0.1028, 0.1426, 0.2147, 0.2585]
-Z_MIN = -5.5  # below this, exp(z) < 1/255 -> rounds to 0 in INT8 anyway
-SHIFT = 2.75  # recentre [-5.5, 0] to [-2.75, 2.75] so symmetric INT8 uses all levels
+class TokenRMSNorm(nn.Module):
+    """Teacher RMSNorm: normalized over the channel dimension, no bias."""
 
-
-class PWLSoftmax(nn.Module):
-    """Softmax over the last dim, built only from NPU-friendly ops."""
-
-    def __init__(self, n, learnable=False):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        bias = torch.tensor(KNOTS) - SHIFT
-        coef = torch.tensor(COEFS)
-        if learnable:
-            self.bias, self.coef = nn.Parameter(bias), nn.Parameter(coef)
-        else:
-            self.register_buffer("bias", bias)
-            self.register_buffer("coef", coef)
-        self.register_buffer("z_min", torch.tensor(Z_MIN))
-        self.register_buffer("ones", torch.ones(n, 1))  # row sum as a MatMul
-
-    def forward(self, s):
-        z = s - s.amax(dim=-1, keepdim=True)  # ReduceMax + Sub   -> z <= 0
-        u = torch.maximum(z, self.z_min) + SHIFT  # Max + Add     -> [-2.75, 2.75]
-        e = 0
-        for i in range(len(KNOTS)):  # 7 x (Add, ReLU, Mul), summed
-            e = e + self.coef[i] * torch.relu(u + self.bias[i])
-        return e / (e @ self.ones)  # MatMul (row sum) + Div
-
-
-class ReLUAttnNorm(nn.Module):
-    """ReLU(s) / n - the simplest softmax-free alternative, for comparison."""
-
-    def __init__(self, n):
-        super().__init__()
-        self.inv_n = 1.0 / n
-
-    def forward(self, s):
-        return torch.relu(s) * self.inv_n
-
-
-def make_attn_norm(kind, n):
-    if kind == "pwl":
-        return PWLSoftmax(n)
-    if kind == "pwl_learn":
-        return PWLSoftmax(n, learnable=True)
-    if kind == "relu":
-        return ReLUAttnNorm(n)
-    if kind == "softmax":  # exact baseline (not NPU-friendly)
-        return nn.Softmax(dim=-1)
-    raise ValueError(kind)
-
-
-# --- BatchNorm over the last (channel) dim of [B, N, C] ---------------------------
-class BNLast(nn.BatchNorm1d):
-    """Per-channel BatchNorm for [B, N, C]; statistics over all B*N tokens."""
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
 
     def forward(self, x):
-        return super().forward(x.reshape(-1, x.shape[-1])).reshape(x.shape)
+        return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + self.eps) * self.weight
 
 
-# --- Transformer -------------------------------------------------------------------
-class Attention(nn.Module):
-    def __init__(self, dim, heads, n_tokens, attn="pwl"):
+class MatMulRMSNorm(nn.Module):
+    """Same RMSNorm math using constant MatMul instead of ReduceMean."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        assert dim % heads == 0
-        self.heads, self.hd = heads, dim // heads
-        self.scale = self.hd**-0.5
-        self.q = nn.Linear(dim, dim)  # three Linears: no Split op
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.proj = nn.Linear(dim, dim)
-        self.norm = make_attn_norm(attn, n_tokens)
-
-    def forward(self, x):  # x: [B, N, C]
-        B, N, C = x.shape
-        h, d = self.heads, self.hd
-        q = (self.q(x) * self.scale).reshape(B, N, h, d).transpose(1, 2)  # [B,h,N,d]
-        k = self.k(x).reshape(B, N, h, d).permute(0, 2, 3, 1)  # [B,h,d,N]
-        v = self.v(x).reshape(B, N, h, d).transpose(1, 2)  # [B,h,N,d]
-        a = self.norm(q @ k)  # [B,h,N,N]
-        o = (a @ v).transpose(1, 2).reshape(B, N, C)  # [B,N,C]
-        return self.proj(o)
-
-
-class Block(nn.Module):
-    def __init__(self, dim, heads, mlp_ratio, n_tokens, attn):
-        super().__init__()
-        hidden = dim * mlp_ratio
-        self.norm1 = BNLast(dim)
-        self.attn = Attention(dim, heads, n_tokens, attn)
-        self.norm2 = BNLast(dim)
-        self.fc1 = nn.Linear(dim, hidden)
-        self.bn_mid = BNLast(hidden)  # extra BN in the MLP: helps BN-ViT training
-        self.act = nn.ReLU()
-        self.fc2 = nn.Linear(hidden, dim)
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+        self.register_buffer("avg", torch.full((dim, 1), 1.0 / dim), persistent=False)
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        return x + self.fc2(self.act(self.bn_mid(self.fc1(self.norm2(x)))))
+        return x / torch.sqrt((x * x) @ self.avg + self.eps) * self.weight
 
 
-class NPUViT(nn.Module):
-    """Input: patches [B, N, patch_dim] from patchify(); output: logits [B, classes]."""
+class HeadRMSNorm(nn.Module):
+    """Teacher QK-Norm, per head and per token over head_dim.
+
+    Each head owns its gain vector; Q and K use separate instances.
+    """
+
+    def __init__(self, heads: int, head_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(heads, head_dim))
+        self.eps = eps
+
+    def forward(self, x):  # [B, H, N, D]
+        return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + self.eps) * self.weight[None, :, None, :]
+
+
+class MatMulHeadRMSNorm(nn.Module):
+    """NPU QK-Norm: a constant MatMul replaces ReduceMean over head_dim."""
+
+    def __init__(self, heads: int, head_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(heads, head_dim))
+        self.eps = eps
+        self.register_buffer("avg", torch.full((head_dim, 1), 1.0 / head_dim), persistent=False)
+
+    def forward(self, x):  # [B, H, N, D]
+        return x / torch.sqrt((x * x) @ self.avg + self.eps) * self.weight[None, :, None, :]
+
+
+class StaticChannelNorm(nn.Module):
+    """Trainable per-channel affine approximation to LayerNorm.
+
+    No sample-wise mean/variance/reduction at runtime. Parameters are fitted by
+    linear regression against the original LayerNorm outputs, then fine-tuned.
+    Unlike LayerNorm this is NOT an exact transformation and needs adaptation.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        return x * self.weight + self.bias
+
+
+class MatMulLayerNorm(nn.Module):
+    """Exact LayerNorm in inference-friendly primitive ops, without LayerNormalization.
+
+    Unlike a static channel affine map, this retains the input-dependent mean
+    and variance. The reductions are fixed MatMuls; verify actual target NPU
+    partitioning / INT8 support for Sqrt and Div before deployment.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+        self.register_buffer("avg", torch.full((dim, 1), 1.0 / dim), persistent=False)
+
+    def forward(self, x):
+        center = x - (x @ self.avg)
+        variance = (center * center) @ self.avg
+        return (center / torch.sqrt(variance + self.eps)) * self.weight + self.bias
+
+
+class CalibratedReLU(nn.Module):
+    """Per-channel approximation GELU(x) ~= gain * ReLU(x) + bias.
+
+    Only the *ordinary ReLU* remains after exporting: gain and bias are frozen
+    calibration buffers and are folded exactly into the following fc2 Linear.
+    """
+
+    def __init__(self, gain: torch.Tensor, bias: torch.Tensor):
+        super().__init__()
+        gain = torch.as_tensor(gain, dtype=torch.float32).detach().flatten()
+        bias = torch.as_tensor(bias, dtype=torch.float32).detach().flatten()
+        if gain.shape != bias.shape or gain.numel() == 0:
+            raise ValueError("CalibratedReLU requires matching per-channel vectors")
+        if not torch.isfinite(gain).all() or not torch.isfinite(bias).all():
+            raise ValueError("Nonfinite ReLU calibration coefficients")
+        self.register_buffer("gain", gain.clone())
+        self.register_buffer("bias", bias.clone())
+
+    def forward(self, x):
+        return torch.relu(x) * self.gain + self.bias
+
+
+class FixedPWLSoftmax(nn.Module):
+    """Per-head fixed PWL approximation to Softmax with optional score centering.
+
+    Calibration defines low_h, high_h and fits exp(s-high_h) with per-head
+    knots. The per-head constant shift does not affect exact Softmax outputs.
+    Uniform or geometric knot spacing is supported. This is range-observed
+    calibration, not a temperature-changing RangeBN transform.
+
+    IMPORTANT: unlike exact Softmax, the result is not shift invariant outside
+    the fitted range. Clip rates and task accuracy must be measured.
+    """
 
     def __init__(
         self,
-        img_size=32,
-        patch=4,
-        in_ch=3,
-        num_classes=10,
-        dim=128,
-        depth=6,
-        heads=4,
-        mlp_ratio=2,
-        attn="pwl",
+        n_tokens: int,
+        low: torch.Tensor,
+        high: torch.Tensor,
+        segments: int = 12,
+        radius: float = 3.0,
+        min_exp: float = 1e-8,
+        score_center: str = "none",
+        knot_spacing: str = "uniform",
     ):
         super().__init__()
-        n = (img_size // patch) ** 2
-        self.n_tokens, self.patch_dim = n, in_ch * patch * patch
+        if segments < 2 or radius <= 0 or min_exp <= 0:
+            raise ValueError("Invalid PWL settings")
+        if score_center not in {"none", "mean", "max"}:
+            raise ValueError("score_center must be none, mean, or max")
+        if knot_spacing not in {"uniform", "geometric"}:
+            raise ValueError("knot_spacing must be uniform or geometric")
+        low = torch.as_tensor(low, dtype=torch.float32).flatten().detach()
+        high = torch.as_tensor(high, dtype=torch.float32).flatten().detach()
+        if low.shape != high.shape or not torch.isfinite(low).all() or not torch.isfinite(high).all():
+            raise ValueError("Invalid attention head ranges")
+        if not (high > low).all():
+            raise ValueError("Each attention high must exceed low")
+        self.segments = segments
+        self.radius = float(radius)
+        self.score_center = score_center
+        self.knot_spacing = knot_spacing
+        self.register_buffer("low", low.view(1, -1, 1, 1).clone())
+        self.register_buffer("high", high.view(1, -1, 1, 1).clone())
+        # Fixed per-head knots in centered, calibrated raw-score coordinates.
+        t = torch.linspace(0, 1, segments + 1, device=low.device)
+        width = (high - low)[:, None]
+        if knot_spacing == "uniform":
+            knots = low[:, None] + width * t[None, :]
+        else:
+            # Most knots near the highest exponent values, where interpolation
+            # error matters. Still fixed coefficients after calibration.
+            knots = high[:, None] - torch.expm1(
+                (1 - t[None, :]) * torch.log1p(width)
+            )
+        # Head-wise subtraction of high is an allowed shift (not a per-row max).
+        values = torch.exp((knots - high[:, None]).clamp(min=-80)).clamp_min(min_exp)
+        slopes = (values[:, 1:] - values[:, :-1]) / (knots[:, 1:] - knots[:, :-1])
+        delta = torch.cat((slopes[:, :1], slopes[:, 1:] - slopes[:, :-1]), dim=1)
+        self.register_buffer("base", values[:, :1].reshape(1, -1, 1, 1).clone())
+        for i in range(segments):
+            # Per-head raw-score coefficients are fixed after calibration.
+            # Individual buffers avoid dynamic Gather/Slice in ONNX.
+            self.register_buffer(f"bias_{i}", -knots[:, i].view(1, -1, 1, 1).clone())
+            self.register_buffer(f"coef_{i}", delta[:, i].view(1, -1, 1, 1).clone())
+        self.register_buffer("ones", torch.ones(n_tokens, 1, device=low.device))
+
+    def center_scores(self, scores):
+        if self.score_center == "max":
+            return scores - scores.amax(dim=-1, keepdim=True)
+        if self.score_center == "mean":
+            return scores - (scores @ self.ones) * (1.0 / self.ones.shape[0])
+        return scores
+
+    def forward(self, scores):
+        centered = self.center_scores(scores)
+        s = torch.minimum(torch.maximum(centered, self.low), self.high)
+        exp_pwl = self.base
+        for i in range(self.segments):
+            exp_pwl = exp_pwl + getattr(self, f"coef_{i}") * torch.relu(
+                s + getattr(self, f"bias_{i}")
+            )
+        # A small roundoff floor is permitted: no row-wise reduction max/Exp.
+        exp_pwl = torch.maximum(exp_pwl, self.base * 0.5)
+        return exp_pwl / (exp_pwl @ self.ones)
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads, n_tokens, *, qk_norm=True, adapted=False):
+        super().__init__()
+        if dim % heads:
+            raise ValueError("dim must be divisible by heads")
+        self.heads, self.hd = heads, dim // heads
+        self.scale = self.hd ** -0.5
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim)
+        self.qk_norm = qk_norm
+        if qk_norm:
+            qkn = MatMulHeadRMSNorm if adapted else HeadRMSNorm
+            self.q_norm = qkn(heads, self.hd)
+            self.k_norm = qkn(heads, self.hd)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+        self.norm = nn.Softmax(dim=-1)
+        self.n_tokens = n_tokens
+
+    def forward(self, x):
+        b, n, c = x.shape
+        q = self.q(x).reshape(b, n, self.heads, self.hd).transpose(1, 2)
+        k = self.k(x).reshape(b, n, self.heads, self.hd).transpose(1, 2)
+        v = self.v(x).reshape(b, n, self.heads, self.hd).transpose(1, 2)
+        # Query and Key are normalized independently, prior to Q @ K^T.
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        attention = self.norm((q @ k.transpose(-2, -1)) * self.scale)
+        return self.proj((attention @ v).transpose(1, 2).reshape(b, n, c))
+
+
+class Block(nn.Module):
+    def __init__(self, dim, heads, mlp_ratio, n_tokens, *, adapted=False,
+                 norm_type="rms", norm_mode="rms_matmul", qk_norm=True):
+        super().__init__()
+        if norm_type == "rms":
+            norm = MatMulRMSNorm if adapted else TokenRMSNorm
+        elif norm_type == "ln":
+            norm = (StaticChannelNorm if norm_mode == "affine" else MatMulLayerNorm) if adapted else nn.LayerNorm
+        else:
+            raise ValueError(f"Unknown norm_type: {norm_type}")
+        self.norm1 = norm(dim)
+        self.attn = Attention(dim, heads, n_tokens, qk_norm=qk_norm, adapted=adapted)
+        self.norm2 = norm(dim)
+        self.fc1 = nn.Linear(dim, dim * mlp_ratio)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(dim * mlp_ratio, dim)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        return x + self.fc2(self.act(self.fc1(self.norm2(x))))
+
+
+class _ViT(nn.Module):
+    def __init__(self, img_size=32, patch=4, in_ch=3, num_classes=10,
+                 dim=128, depth=6, heads=4, mlp_ratio=2, adapted=False,
+                 norm_type="rms", norm_mode=None, qk_norm=True):
+        super().__init__()
+        if img_size % patch:
+            raise ValueError("img_size must be divisible by patch")
+        if norm_type not in {"rms", "ln"}:
+            raise ValueError("norm_type must be rms or ln")
+        if norm_mode is None:
+            norm_mode = "rms_matmul" if norm_type == "rms" else "matmul"
+        if norm_mode not in {"affine", "matmul", "rms_matmul"}:
+            raise ValueError("norm_mode must be affine, matmul or rms_matmul")
+        if adapted and ((norm_type == "rms" and norm_mode != "rms_matmul") or
+                        (norm_type == "ln" and norm_mode == "rms_matmul")):
+            raise ValueError("rms requires rms_matmul; ln requires matmul or affine")
+        self.config = dict(img_size=img_size, patch=patch, in_ch=in_ch,
+                           num_classes=num_classes, dim=dim, depth=depth,
+                           heads=heads, mlp_ratio=mlp_ratio,
+                           norm_type=norm_type, qk_norm=qk_norm)
+        self.norm_mode = norm_mode
+        self.norm_type = norm_type
+        self.qk_norm = qk_norm
+        self.patch = patch
+        self.n_tokens = (img_size // patch) ** 2
+        self.patch_dim = in_ch * patch * patch
         self.patch_embed = nn.Linear(self.patch_dim, dim)
-        self.patch_bn = BNLast(dim)
-        self.pos = nn.Parameter(torch.zeros(1, n, dim))
+        self.pos = nn.Parameter(torch.zeros(1, self.n_tokens, dim))
         nn.init.trunc_normal_(self.pos, std=0.02)
-        self.blocks = nn.ModuleList(Block(dim, heads, mlp_ratio, n, attn) for _ in range(depth))
-        self.norm = BNLast(dim)
-        self.register_buffer("avg", torch.full((1, n), 1.0 / n))  # mean pool as MatMul
+        self.blocks = nn.ModuleList(
+            Block(dim, heads, mlp_ratio, self.n_tokens, adapted=adapted,
+                  norm_type=norm_type, norm_mode=norm_mode, qk_norm=qk_norm)
+            for _ in range(depth)
+        )
+        if norm_type == "rms":
+            norm = MatMulRMSNorm if adapted else TokenRMSNorm
+        else:
+            norm = (StaticChannelNorm if norm_mode == "affine" else MatMulLayerNorm) if adapted else nn.LayerNorm
+        self.norm = norm(dim)
+        self.register_buffer("avg", torch.full((1, self.n_tokens), 1.0 / self.n_tokens))
         self.head = nn.Linear(dim, num_classes)
 
-    def forward(self, p):  # p: [B, N, patch_dim]
-        x = self.patch_bn(self.patch_embed(p)) + self.pos
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.avg @ self.norm(x)  # [B, 1, C]
-        return self.head(x).reshape(x.shape[0], -1)  # [B, classes]
+    def forward(self, patches):
+        x = self.patch_embed(patches) + self.pos
+        for block in self.blocks:
+            x = block(x)
+        x = self.avg @ self.norm(x)
+        return self.head(x).reshape(x.shape[0], -1)
 
 
-# --- BatchNorm folding into Linear layers (exact, inference only) -------------------
-def _bn_affine(bn):
-    a = bn.weight / torch.sqrt(bn.running_var + bn.eps)
-    return a, bn.bias - bn.running_mean * a
+class StandardViT(_ViT):
+    """FP32 teacher: RMSNorm + QK RMSNorm + GELU + exact Softmax by default."""
+
+    def __init__(self, **kwargs):
+        super().__init__(adapted=False, **kwargs)
+
+
+class NPUViT(_ViT):
+    """Student: constant-MatMul RMSNorm/QK-Norm + calibrated ReLU and PWL."""
+
+    def __init__(self, norm_mode=None, **kwargs):
+        super().__init__(adapted=True, norm_mode=norm_mode, **kwargs)
+
+
+# ---- Input and streaming observers: all executed only in calibration ----
+def _as_patches(batch, model, device=None):
+    if isinstance(batch, (list, tuple)):
+        batch = batch[0]
+    if not isinstance(batch, torch.Tensor):
+        batch = torch.as_tensor(batch)
+    if device is None:
+        device = next(model.parameters()).device
+    batch = batch.to(device, dtype=next(model.parameters()).dtype)
+    if batch.ndim == 4:
+        batch = patchify(batch, model.patch)
+    if batch.ndim != 3 or batch.shape[1:] != (model.n_tokens, model.patch_dim):
+        raise ValueError("Calibration expects images [B,C,H,W] or patches [B,N,D]")
+    return batch
+
+
+class _AffineRegression:
+    """Collect per-channel moments for fitting LN(x) ~ gain*x + bias."""
+
+    def __init__(self, channels):
+        self.channels = channels
+        self.n = 0
+        self.sx = torch.zeros(channels, dtype=torch.float64)
+        self.sy = torch.zeros(channels, dtype=torch.float64)
+        self.sxx = torch.zeros(channels, dtype=torch.float64)
+        self.sxy = torch.zeros(channels, dtype=torch.float64)
+
+    @torch.no_grad()
+    def hook(self, module, args, output):
+        x = args[0].detach().reshape(-1, self.channels).double()
+        y = output.detach().reshape(-1, self.channels).double()
+        self.n += x.shape[0]
+        self.sx += x.sum(0).cpu()
+        self.sy += y.sum(0).cpu()
+        self.sxx += (x * x).sum(0).cpu()
+        self.sxy += (x * y).sum(0).cpu()
+
+    def coefficients(self):
+        if not self.n:
+            raise RuntimeError("No LayerNorm samples received")
+        vx = (self.sxx - self.sx * self.sx / self.n).clamp_min(0)
+        cov = self.sxy - self.sx * self.sy / self.n
+        gain = cov / vx.clamp_min(1e-10)
+        bias = (self.sy - gain * self.sx) / self.n
+        return gain.float(), bias.float()
+
+
+class _ReLURegression(_AffineRegression):
+    """Calibrate per-channel GELU targets against ordinary ReLU activations.
+
+    Use a pre-hook so this works on both the initial nn.GELU and on an already
+    converted CalibratedReLU during post-fine-tuning recalibration.
+    """
+
+    @torch.no_grad()
+    def hook(self, module, args):
+        preact = args[0].detach().reshape(-1, self.channels).float()
+        x = torch.relu(preact).double()
+        y = F.gelu(preact).double()
+        self.n += x.shape[0]
+        self.sx += x.sum(0).cpu()
+        self.sy += y.sum(0).cpu()
+        self.sxx += (x * x).sum(0).cpu()
+        self.sxy += (x * y).sum(0).cpu()
+
+    def coefficients(self):
+        if not self.n:
+            raise RuntimeError("No activation samples received")
+        variance = (self.sxx - self.sx * self.sx / self.n).clamp_min(0)
+        covariance = self.sxy - self.sx * self.sy / self.n
+        # A channel with nearly constant ReLU output cannot identify a slope.
+        gain = torch.where(variance > 1e-8, covariance / variance.clamp_min(1e-8),
+                           torch.ones_like(variance)).clamp(0.0, 2.0)
+        bias = (self.sy - gain * self.sx) / self.n
+        return gain.float(), bias.float()
+
+
+class _RangeSamples:
+    """Lightweight representative quantile samples; never shipped in ONNX."""
+
+    def __init__(self, heads=None, per_batch=2048, score_center="none"):
+        self.heads = heads
+        self.per_batch = per_batch
+        self.score_center = score_center
+        self.samples = []
+        self.seen = 0
+
+    @torch.no_grad()
+    def hook(self, module, args):
+        x = args[0].detach().float()
+        if self.heads is not None:
+            if self.score_center == "max":
+                x = x - x.amax(dim=-1, keepdim=True)
+            elif self.score_center == "mean":
+                x = x - x.mean(dim=-1, keepdim=True)
+        if self.heads is None:
+            flat = x.reshape(-1)
+            i = torch.linspace(0, flat.numel() - 1, min(self.per_batch, flat.numel()),
+                               device=flat.device).long()
+            self.samples.append(flat[i].cpu())
+        else:
+            # [B,H,Q,K] -> [H,B*Q*K], sample evenly per head.
+            flat = x.permute(1, 0, 2, 3).reshape(self.heads, -1)
+            i = torch.linspace(0, flat.shape[1] - 1, min(self.per_batch, flat.shape[1]),
+                               device=flat.device).long()
+            self.samples.append(flat[:, i].cpu())
+        self.seen += 1
+
+    def bounds(self, tail=0.001, margin=0.05):
+        if not self.samples:
+            raise RuntimeError("No calibration samples observed")
+        values = torch.cat(self.samples, dim=-1)
+        if not torch.isfinite(values).all():
+            raise ValueError("Non-finite calibration values")
+        if not (0 <= tail < 0.5) or margin < 0:
+            raise ValueError("Invalid calibration tail/margin")
+        low = torch.quantile(values, tail, dim=-1)
+        high = torch.quantile(values, 1.0 - tail, dim=-1)
+        center = (low + high) / 2
+        radius = (high - low).clamp_min(1e-4) * (0.5 + margin)
+        return center - radius, center + radius
+
+
+def _check_calib_loader(loader):
+    if iter(loader) is loader:
+        raise ValueError("Use a re-iterable DataLoader/list, not a one-shot iterator")
 
 
 @torch.no_grad()
-def _fold_after(lin, bn):
-    """linear -> bn   ==>   linear'"""
-    a, b = _bn_affine(bn)
-    lin.weight.mul_(a.view(-1, 1))
-    lin.bias.copy_(lin.bias * a + b)
+def fit_static_norms(teacher: StandardViT, calibration_loader, max_batches=None,
+                     norm_mode=None):
+    """Transfer trained RMSNorm weights exactly, or fit legacy LN affine."""
+    _check_calib_loader(calibration_loader)
+    if max_batches is not None and max_batches < 1:
+        raise ValueError("max_batches must be positive")
+    if norm_mode is None:
+        norm_mode = "rms_matmul" if teacher.norm_type == "rms" else "matmul"
+    if teacher.norm_type == "rms" and norm_mode != "rms_matmul":
+        raise ValueError("RMSNorm teachers require norm_mode='rms_matmul'")
+    if teacher.norm_type == "ln" and norm_mode not in {"matmul", "affine"}:
+        raise ValueError("LayerNorm teachers require norm_mode='matmul' or 'affine'")
+    device = next(teacher.parameters()).device
+    teacher.eval()
+    if norm_mode in {"matmul", "rms_matmul"}:
+        student = NPUViT(**teacher.config, norm_mode=norm_mode).to(device)
+        # avg MatMul buffers are nonpersistent; all trainable parameter keys match.
+        student.load_state_dict(teacher.state_dict(), strict=True)
+        return student.eval()
+    stats = {}
+    hooks = []
+    for name, module in teacher.named_modules():
+        if isinstance(module, nn.LayerNorm):
+            stats[name] = _AffineRegression(module.normalized_shape[0])
+            hooks.append(module.register_forward_hook(stats[name].hook))
+    try:
+        for idx, batch in enumerate(calibration_loader):
+            if max_batches is not None and idx >= max_batches:
+                break
+            teacher(_as_patches(batch, teacher, device))
+    finally:
+        for hook in hooks:
+            hook.remove()
+    student = NPUViT(**teacher.config, norm_mode=norm_mode).to(device)
+    student.load_state_dict(teacher.state_dict(), strict=True)
+    for name, module in student.named_modules():
+        if isinstance(module, StaticChannelNorm):
+            gain, bias = stats[name].coefficients()
+            module.weight.copy_(gain.to(device))
+            module.bias.copy_(bias.to(device))
+    return student.eval()
 
 
 @torch.no_grad()
-def _fold_before(bn, *lins):
-    """bn -> linear(s)   ==>   linear'(s)"""
-    a, b = _bn_affine(bn)
-    for lin in lins:
-        lin.bias.add_(lin.weight @ b)
-        lin.weight.mul_(a.view(1, -1))
+def calibrate_npu(
+    student: NPUViT,
+    calibration_loader,
+    *,
+    max_batches=None,
+    softmax_segments=12,
+    tail=0.001,
+    margin=0.05,
+    radius=3.0,
+    score_center="mean",
+    knot_spacing="geometric",
+    verbose=True,
+):
+    """Fit GELU -> gain*ReLU+bias and score -> fixed PWL, block by block.
+
+    Works both before and after fine-tuning. ReLU coefficients and fixed PWL
+    buffers are fitted from *current* student activations in eval mode.
+    """
+    _check_calib_loader(calibration_loader)
+    student.eval()
+    device = next(student.parameters()).device
+    for idx, block in enumerate(student.blocks):
+        relu_stats = _ReLURegression(block.fc1.out_features)
+        score_stats = _RangeSamples(heads=block.attn.heads, score_center=score_center)
+        hooks = [
+            block.act.register_forward_pre_hook(relu_stats.hook),
+            block.attn.norm.register_forward_pre_hook(score_stats.hook),
+        ]
+        try:
+            for bi, batch in enumerate(calibration_loader):
+                if max_batches is not None and bi >= max_batches:
+                    break
+                student(_as_patches(batch, student, device))
+        finally:
+            for hook in hooks:
+                hook.remove()
+        gain, bias = relu_stats.coefficients()
+        low_score, high_score = score_stats.bounds(tail, margin)
+        block.act = CalibratedReLU(gain, bias).to(device)
+        block.attn.norm = FixedPWLSoftmax(
+            student.n_tokens, low_score, high_score, softmax_segments, radius,
+            score_center=score_center, knot_spacing=knot_spacing,
+        ).to(device)
+        if verbose:
+            print(f"  calibrated block {idx + 1}/{len(student.blocks)} "
+                  f"({score_center=}, {knot_spacing=}): "
+                  f"ReLU gain [{float(gain.min()):.3f}, {float(gain.max()):.3f}], "
+                  f"attention head widths {(high_score - low_score).tolist()}")
+    return student
 
 
 @torch.no_grad()
-def fold_batchnorms(model):
-    """Return a copy of the model with every BatchNorm folded into a Linear."""
-    m = copy.deepcopy(model).eval()
-    _fold_after(m.patch_embed, m.patch_bn)
-    m.patch_bn = nn.Identity()
-    for blk in m.blocks:
-        _fold_before(blk.norm1, blk.attn.q, blk.attn.k, blk.attn.v)
-        blk.norm1 = nn.Identity()
-        _fold_after(blk.fc1, blk.bn_mid)
-        blk.bn_mid = nn.Identity()
-        _fold_before(blk.norm2, blk.fc1)
-        blk.norm2 = nn.Identity()
-    _fold_before(m.norm, m.head)
-    m.norm = nn.Identity()  # BN commutes with mean pooling
+def convert_to_npu(
+    teacher: StandardViT,
+    calibration_loader,
+    *,
+    max_batches=None,
+    softmax_segments=12,
+    tail=0.001,
+    margin=0.05,
+    norm_mode=None,
+    score_center="mean",
+    knot_spacing="geometric",
+    verbose=True,
+):
+    """Weight transfer + norm conversion + GELU->ReLU + PWL Softmax."""
+    student = fit_static_norms(
+        teacher, calibration_loader, max_batches=max_batches, norm_mode=norm_mode
+    )
+    return calibrate_npu(
+        student, calibration_loader, max_batches=max_batches,
+        softmax_segments=softmax_segments,
+        tail=tail, margin=margin, score_center=score_center,
+        knot_spacing=knot_spacing, verbose=verbose,
+    )
+
+
+@torch.no_grad()
+def measure_saturation(student, validation_loader, max_batches=None):
+    """Measure held-out PWL attention saturation and ReLU-vs-GELU MSE."""
+    student.eval()
+    data = {}
+    handles = []
+    for i, block in enumerate(student.blocks):
+        if not isinstance(block.attn.norm, FixedPWLSoftmax) or not isinstance(block.act, CalibratedReLU):
+            raise ValueError("Model has not been fully calibrated")
+        data[i] = {"attn_count": torch.zeros(block.attn.heads, dtype=torch.float64),
+                   "attn_total": 0, "relu_sqerr": 0.0, "relu_total": 0}
+
+        def score_hook(module, args, i=i):
+            x = module.center_scores(args[0])
+            count = ((x < module.low) | (x > module.high)).sum(dim=(0, 2, 3))
+            data[i]["attn_count"] += count.detach().double().cpu()
+            data[i]["attn_total"] += x.shape[0] * x.shape[2] * x.shape[3]
+
+        def relu_hook(module, args, output, i=i):
+            target = F.gelu(args[0].detach())
+            error = output.detach() - target
+            data[i]["relu_sqerr"] += float(error.square().sum().item())
+            data[i]["relu_total"] += error.numel()
+
+        handles.append(block.attn.norm.register_forward_pre_hook(score_hook))
+        handles.append(block.act.register_forward_hook(relu_hook))
+    try:
+        for bi, batch in enumerate(validation_loader):
+            if max_batches is not None and bi >= max_batches:
+                break
+            student(_as_patches(batch, student))
+    finally:
+        for handle in handles:
+            handle.remove()
+    if not data or not all(d["attn_total"] for d in data.values()):
+        raise ValueError("No validation batches")
+    return {
+        i: {"attention_per_head": (stats["attn_count"] / stats["attn_total"]).tolist(),
+            "relu_vs_gelu_mse": stats["relu_sqerr"] / stats["relu_total"]}
+        for i, stats in data.items()
+    }
+
+
+@torch.no_grad()
+def fold_affine_norms(student: NPUViT):
+    """Fold affine norms when available, always fold calibrated ReLU gain/bias.
+
+    MatMulLayerNorm, MatMulRMSNorm and MatMulHeadRMSNorm remain dynamic.
+    """
+    if any(not isinstance(b.attn.norm, FixedPWLSoftmax) or
+           not isinstance(b.act, CalibratedReLU) for b in student.blocks):
+        raise ValueError("Calibrate all ReLU and attention layers before folding")
+    m = copy.deepcopy(student).eval()
+
+    def fold(norm, *linears):
+        w, b = norm.weight.detach(), norm.bias.detach()
+        for linear in linears:
+            old = linear.weight.detach().clone()
+            linear.bias.add_(old @ b)
+            linear.weight.mul_(w[None, :])
+
+    for block in m.blocks:
+        if isinstance(block.norm1, StaticChannelNorm):
+            fold(block.norm1, block.attn.q, block.attn.k, block.attn.v)
+            block.norm1 = nn.Identity()
+        if isinstance(block.norm2, StaticChannelNorm):
+            fold(block.norm2, block.fc1)
+            block.norm2 = nn.Identity()
+        # GELU -> calibrated ReLU, with gain+bias absorbed into the output Linear.
+        gain, bias = block.act.gain.detach(), block.act.bias.detach()
+        old_weight = block.fc2.weight.detach().clone()
+        block.fc2.bias.add_(old_weight @ bias)
+        block.fc2.weight.mul_(gain[None, :])
+        block.act = nn.ReLU()
+    # Mean over tokens commutes with any per-channel affine map.
+    if isinstance(m.norm, StaticChannelNorm):
+        fold(m.norm, m.head)
+        m.norm = nn.Identity()
     return m
 
 
-# --- Export + op audit ----------------------------------------------------------
-# Ops AMD's Ryzen AI 1.8 table lists for XINT8 (the format to use on Hawk Point).
 XINT8_LISTED = {
-    "Add",
-    "AveragePool",
-    "BatchNormalization",
-    "Concat",
-    "Constant",
-    "ConstantOfShape",
-    "Conv",
-    "DepthToSpace",
-    "Div",
-    "Expand",
-    "Flatten",
-    "Gemm",
-    "GlobalAveragePool",
-    "Identity",
-    "InstanceNormalization",
-    "MatMul",
-    "Max",
-    "MaxPool",
-    "Min",
-    "Mul",
-    "Pad",
-    "Reciprocal",
-    "ReduceMax",
-    "Reshape",
-    "Shape",
-    "Slice",
-    "Sqrt",
-    "Squeeze",
-    "Sub",
-    "Transpose",
-    "Unsqueeze",
+    "Add", "AveragePool", "BatchNormalization", "Concat", "Constant", "ConstantOfShape",
+    "Conv", "DepthToSpace", "Div", "Expand", "Flatten", "Gemm", "GlobalAveragePool",
+    "Identity", "InstanceNormalization", "MatMul", "Max", "MaxPool", "Min", "Mul",
+    "Pad", "Reciprocal", "ReduceMax", "Reshape", "Shape", "Slice", "Sqrt",
+    "Squeeze", "Sub", "Transpose", "Unsqueeze",
 }
 
 
 def export_onnx(model, path):
-    folded = fold_batchnorms(model)
-    dummy = torch.randn(1, model.n_tokens, model.patch_dim)
-    kw = {"opset_version": 17, "input_names": ["input"], "output_names": ["logits"]}
+    """Export folded fixed-PWL student (never the normal teacher)."""
+    folded = fold_affine_norms(model)
+    parameter = next(folded.parameters())
+    dummy = torch.randn(1, folded.n_tokens, folded.patch_dim, device=parameter.device,
+                        dtype=parameter.dtype)
+    kwargs = dict(opset_version=17, input_names=["input"], output_names=["logits"])
     try:
-        torch.onnx.export(folded, dummy, str(path), dynamo=False, **kw)
-    except TypeError:  # torch < 2.5 has no `dynamo` arg
-        torch.onnx.export(folded, dummy, str(path), **kw)
+        torch.onnx.export(folded, dummy, str(path), dynamo=False, **kwargs)
+    except TypeError:
+        torch.onnx.export(folded, dummy, str(path), **kwargs)
     return str(path)
 
 
 def audit_onnx(path):
     import onnx
-
-    ops = collections.Counter(n.op_type for n in onnx.load(str(path)).graph.node)
-    print(f"\nOp audit for {path}:")
-    for op, n in sorted(ops.items()):
-        note = "XINT8 listed" if op in XINT8_LISTED else "NOT listed for XINT8 - check NPU log"
-        if op == "Relu":
-            note = "not in XINT8 column - check NPU log"
-        print(f"  {op:20s} x{n:<4d} {note}")
+    ops = collections.Counter(node.op_type for node in onnx.load(str(path)).graph.node)
+    print(f"\nExported ONNX operators in {path}:")
+    for op, count in sorted(ops.items()):
+        note = "listed XINT8" if op in XINT8_LISTED else "confirm NPU support"
+        print(f"  {op:20s} {count:4d}   {note}")
+    forbidden = {"LayerNormalization", "Softmax", "Exp", "BatchNormalization", "Gelu", "Erf"}
+    if ops.keys() & forbidden:
+        raise AssertionError(f"Unexpected ops in exported NPU graph: {ops.keys() & forbidden}")
     return ops
 
 
 def selftest():
-    """Run a quick self-test covering PWLSoftmax, patchify, BN folding, and ONNX export."""
-    torch.manual_seed(0)
-
-    s = torch.randn(1000, 64) * 2.0
-    err = (PWLSoftmax(64)(s) - torch.softmax(s, -1)).abs()
-    print(f"PWLSoftmax vs softmax: max abs err {err.max():.4f}, mean {err.mean():.5f}")
-
-    imgs = torch.randn(4, 3, 32, 32)
-    assert np.allclose(patchify(imgs).numpy(), patchify_np(imgs.numpy()))
-    print("patchify (torch) == patchify_np (numpy): OK")
-
-    model = NPUViT()
-    model.train()
-    for _ in range(3):  # populate BN running stats
-        model(patchify(torch.randn(16, 3, 32, 32)))
-    model.eval()
-    x = patchify(imgs)
-    diff = (model(x) - fold_batchnorms(model)(x)).abs().max()
-    print(f"BN folding max diff: {diff:.2e}")
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = export_onnx(model, os.path.join(tmpdir, "npu_vit_selftest.onnx"))
-        audit_onnx(path)
-        try:
-            import onnxruntime as ort
-
-            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-            out = sess.run(None, {"input": x[:1].numpy()})[0]
-            print(
-                "\nONNX Runtime vs PyTorch max diff: "
-                f"{abs(out - model(x[:1]).detach().numpy()).max():.2e}"
-            )
-        except ImportError:
-            print("onnxruntime not installed - skipped runtime check")
+    torch.manual_seed(42)
+    images = torch.randn(5, 3, 32, 32)
+    assert np.allclose(patchify(images, 8).numpy(), patchify_np(images.numpy(), 8))
+    teacher = StandardViT(dim=32, depth=2, heads=4, patch=8)
+    patches = patchify(images, 8)
+    teacher.eval()
+    calib = [images[:3], images[2:]]
+    student = convert_to_npu(teacher, calib, softmax_segments=12, score_center="mean", knot_spacing="geometric")
+    original = teacher(patches)
+    adapted = student(patches)
+    folded = fold_affine_norms(student)(patches)
+    print("teacher/student max logit difference:", (original - adapted).abs().max().item())
+    print("folded/student max difference:", (folded - adapted).abs().max().item())
+    assert torch.isfinite(adapted).all()
+    assert (folded - adapted).abs().max() < 1e-5
+    for block in student.blocks:
+        assert not any(isinstance(m, nn.LayerNorm) for m in block.modules())
+        assert isinstance(block.act, CalibratedReLU)
+        assert isinstance(block.attn.norm, FixedPWLSoftmax)
+        test_s = torch.randn(2, block.attn.heads, student.n_tokens, student.n_tokens)
+        a = block.attn.norm(test_s)
+        assert torch.isfinite(a).all()
+        assert torch.allclose(a.sum(-1), torch.ones_like(a.sum(-1)), atol=1e-5)
+        assert not any(p.requires_grad for p in block.act.parameters())
+        assert not any(p.requires_grad for p in block.attn.norm.parameters())
+    print("held-out saturation:", measure_saturation(student, calib))
+    # A refresh must be repeatable after fine-tuning.
+    calibrate_npu(student, calib, verbose=False)
+    assert all(isinstance(b.act, nn.ReLU) for b in fold_affine_norms(student).blocks)
+    print("model self-test: OK")
 
 
 if __name__ == "__main__":
