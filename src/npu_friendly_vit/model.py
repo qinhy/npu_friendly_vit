@@ -211,6 +211,19 @@ def _token_norm(dim, norm_type, norm_mode, adapted):
     return norm(dim)
 
 
+class GELUReLUBlend(nn.Module):
+    """Training activation with a scheduled ReLU weight."""
+
+    def __init__(self):
+        super().__init__()
+        self.relu_fraction = 0.0
+
+    def forward(self, x):
+        if self.relu_fraction == 0.0:
+            return F.gelu(x)
+        return torch.lerp(F.gelu(x), F.relu(x), self.relu_fraction)
+
+
 class CalibratedReLU(nn.Module):
     """Per-channel approximation GELU(x) ~= gain * ReLU(x) + bias.
 
@@ -553,14 +566,17 @@ class Attention(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim, heads, mlp_ratio, n_tokens, *, adapted=False,
-                 norm_type="rms", norm_mode=None, qk_norm=True, qk_norm_type="rms"):
+                 norm_type="rms", norm_mode=None, qk_norm=True, qk_norm_type="rms",
+                 ffn_activation="gelu"):
         super().__init__()
         self.norm1 = _token_norm(dim, norm_type, norm_mode, adapted)
         self.attn = Attention(dim, heads, n_tokens, qk_norm=qk_norm,
                               qk_norm_type=qk_norm_type, adapted=adapted)
         self.norm2 = _token_norm(dim, norm_type, norm_mode, adapted)
         self.fc1 = nn.Linear(dim, dim * mlp_ratio)
-        self.act = nn.GELU()
+        if ffn_activation not in {"gelu", "relu"}:
+            raise ValueError("ffn_activation must be gelu or relu")
+        self.act = nn.ReLU() if ffn_activation == "relu" else nn.GELU()
         self.fc2 = nn.Linear(dim * mlp_ratio, dim)
 
     def forward(self, x):
@@ -571,7 +587,8 @@ class Block(nn.Module):
 class _ViT(nn.Module):
     def __init__(self, img_size=32, patch=4, in_ch=3, num_classes=10,
                  dim=128, depth=6, heads=4, mlp_ratio=2, adapted=False,
-                 norm_type="rms", norm_mode=None, qk_norm=True, qk_norm_type="rms"):
+                 norm_type="rms", norm_mode=None, qk_norm=True, qk_norm_type="rms",
+                 ffn_activation="gelu"):
         super().__init__()
         if img_size % patch:
             raise ValueError("img_size must be divisible by patch")
@@ -579,11 +596,13 @@ class _ViT(nn.Module):
         self.config = dict(img_size=img_size, patch=patch, in_ch=in_ch,
                            num_classes=num_classes, dim=dim, depth=depth,
                            heads=heads, mlp_ratio=mlp_ratio,
-                           norm_type=norm_type, qk_norm=qk_norm, qk_norm_type=qk_norm_type)
+                           norm_type=norm_type, qk_norm=qk_norm, qk_norm_type=qk_norm_type,
+                           ffn_activation=ffn_activation)
         self.norm_mode = norm_mode
         self.norm_type = norm_type
         self.qk_norm = qk_norm
         self.qk_norm_type = qk_norm_type
+        self.ffn_activation = ffn_activation
         self.patch = patch
         self.n_tokens = (img_size // patch) ** 2
         self.patch_dim = in_ch * patch * patch
@@ -593,7 +612,7 @@ class _ViT(nn.Module):
         self.blocks = nn.ModuleList(
             Block(dim, heads, mlp_ratio, self.n_tokens, adapted=adapted,
                   norm_type=norm_type, norm_mode=norm_mode, qk_norm=qk_norm,
-                  qk_norm_type=qk_norm_type)
+                  qk_norm_type=qk_norm_type, ffn_activation=ffn_activation)
             for _ in range(depth)
         )
         self.norm = _token_norm(dim, norm_type, norm_mode, adapted)
@@ -809,7 +828,7 @@ def calibrate_npu(
     knot_spacing="geometric",
     verbose=True,
 ):
-    """Convert GELU to calibrated ReLU; calibrate per-head Softmax approximation.
+    """Calibrate attention and fit a ReLU affine for FFNs that use GELU.
 
     mlp: warm-start a six-hinge ReLU network, fit its knot/slope coefficients to
          *current student attention scores* with an exact Softmax KL objective.
@@ -822,28 +841,36 @@ def calibrate_npu(
     student.eval()
     device = next(student.parameters()).device
     for idx, block in enumerate(student.blocks):
-        relu_stats = _ReLURegression(block.fc1.out_features)
+        relu_stats = None if isinstance(block.act, nn.ReLU) else _ReLURegression(block.fc1.out_features)
         score_stats = _RangeSamples(heads=block.attn.heads, score_center=score_center)
         row_stats = _ScoreRowSamples(max_rows=mlp_rows) if softmax_kind == "mlp" else None
-        hooks = [block.act.register_forward_pre_hook(relu_stats.hook)]
+        hooks = []
+        if relu_stats is not None:
+            hooks.append(block.act.register_forward_pre_hook(relu_stats.hook))
         if softmax_kind != "native":
             hooks.append(block.attn.norm.register_forward_pre_hook(score_stats.hook))
         if row_stats is not None:
             hooks.append(block.attn.norm.register_forward_pre_hook(row_stats.hook))
-        try:
-            for bi, batch in enumerate(calibration_loader):
-                if max_batches is not None and bi >= max_batches:
-                    break
-                student(_as_patches(batch, student, device))
-        finally:
-            for hook in hooks:
-                hook.remove()
-        gain, bias = relu_stats.coefficients()
-        block.act = CalibratedReLU(gain, bias).to(device)
+        if hooks:
+            try:
+                for bi, batch in enumerate(calibration_loader):
+                    if max_batches is not None and bi >= max_batches:
+                        break
+                    student(_as_patches(batch, student, device))
+            finally:
+                for hook in hooks:
+                    hook.remove()
+        relu_label = "plain ReLU"
+        if relu_stats is not None:
+            gain, bias = relu_stats.coefficients()
+            block.act = CalibratedReLU(gain, bias).to(device)
+            if verbose:
+                relu_label = f"ReLU gain [{float(gain.min()):.3f}, {float(gain.max()):.3f}]"
         if softmax_kind == "native":
             block.attn.norm = nn.Softmax(dim=-1)
             if verbose:
-                print(f"  calibrated block {idx+1}/{len(student.blocks)}: ReLU only, native Softmax", flush=True)
+                print(f"  block {idx+1}/{len(student.blocks)}: {relu_label}, native Softmax",
+                      flush=True)
             continue
         low_score, high_score = score_stats.bounds(tail, margin)
         if softmax_kind == "mlp":
@@ -862,7 +889,7 @@ def calibrate_npu(
         if verbose:
             print(f"  calibrated block {idx+1}/{len(student.blocks)}: "
                   f"{softmax_kind}({mlp_hidden if softmax_kind == 'mlp' else softmax_segments}), "
-                  f"ReLU gain [{float(gain.min()):.3f}, {float(gain.max()):.3f}], "
+                  f"{relu_label}, "
                   f"attention widths {(high_score - low_score).tolist()}", flush=True)
     return student
 
@@ -887,7 +914,7 @@ def convert_to_npu(
     knot_spacing="geometric",
     verbose=True,
 ):
-    """Transfer teacher weights and calibrate ReLU and attention."""
+    """Transfer teacher weights and calibrate attention and any GELU replacements."""
     student = fit_static_norms(teacher, calibration_loader, max_batches=max_batches,
                                norm_mode=norm_mode)
     return calibrate_npu(
@@ -907,7 +934,8 @@ def measure_saturation(student, validation_loader, max_batches=None):
     data = {}
     handles = []
     for i, block in enumerate(student.blocks):
-        if not isinstance(block.attn.norm, (FixedPWLSoftmax, LearnedMLPSoftmax, nn.Softmax)) or not isinstance(block.act, CalibratedReLU):
+        if (not isinstance(block.attn.norm, (FixedPWLSoftmax, LearnedMLPSoftmax, nn.Softmax))
+                or not isinstance(block.act, (nn.ReLU, CalibratedReLU))):
             raise ValueError("Model has not been fully calibrated")
         data[i] = {"attn_count": torch.zeros(block.attn.heads, dtype=torch.float64),
                    "attn_total": 0, "relu_sqerr": 0.0, "relu_total": 0}
@@ -928,21 +956,25 @@ def measure_saturation(student, validation_loader, max_batches=None):
 
         if not isinstance(block.attn.norm, nn.Softmax):
             handles.append(block.attn.norm.register_forward_pre_hook(score_hook))
-        handles.append(block.act.register_forward_hook(relu_hook))
+        if isinstance(block.act, CalibratedReLU):
+            handles.append(block.act.register_forward_hook(relu_hook))
+    num_batches = 0
     try:
         for bi, batch in enumerate(validation_loader):
             if max_batches is not None and bi >= max_batches:
                 break
             student(_as_patches(batch, student))
+            num_batches += 1
     finally:
         for handle in handles:
             handle.remove()
-    if not data or not all(d["relu_total"] for d in data.values()):
+    if not data or not num_batches:
         raise ValueError("No validation batches")
     return {
         i: {"attention_per_head": ((stats["attn_count"] / stats["attn_total"]).tolist()
                                    if stats["attn_total"] else None),
-            "relu_vs_gelu_mse": stats["relu_sqerr"] / stats["relu_total"]}
+            "relu_vs_gelu_mse": (stats["relu_sqerr"] / stats["relu_total"]
+                                 if stats["relu_total"] else None)}
         for i, stats in data.items()
     }
 
@@ -951,8 +983,8 @@ def measure_saturation(student, validation_loader, max_batches=None):
 def fold_affine_norms(student: NPUViT):
     """Fold token affines, Q/K input scales, and calibrated ReLU affines for export."""
     if any(not isinstance(b.attn.norm, (FixedPWLSoftmax, LearnedMLPSoftmax, nn.Softmax)) or
-           not isinstance(b.act, CalibratedReLU) for b in student.blocks):
-        raise ValueError("Calibrate all ReLU and attention layers before folding")
+           not isinstance(b.act, (nn.ReLU, CalibratedReLU)) for b in student.blocks):
+        raise ValueError("Complete activation conversion and attention calibration before folding")
     m = copy.deepcopy(student).eval()
 
     def fold_affine(gain, bias, *linears):
@@ -980,9 +1012,9 @@ def fold_affine_norms(student: NPUViT):
                 proj.weight.mul_(scale[:, None])
                 proj.bias.mul_(scale)
                 norm.alpha = None
-        # GELU -> calibrated ReLU, with gain+bias absorbed into the output Linear.
-        fold_affine(block.act.gain, block.act.bias, block.fc2)
-        block.act = nn.ReLU()
+        if isinstance(block.act, CalibratedReLU):
+            fold_affine(block.act.gain, block.act.bias, block.fc2)
+            block.act = nn.ReLU()
     # Mean over tokens commutes with any per-channel affine map.
     m.norm = fold_token_norm(m.norm, m.head)
     return m

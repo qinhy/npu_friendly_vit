@@ -11,6 +11,8 @@ from npu_friendly_vit.train import load_student, load_teacher, main
     (["--norm-type", "harddyt", "--qk-norm-type", "harddyt"], "harddyt", "harddyt", 1),
     (["--norm-type", "harddyt", "--qk-norm-type", "harddyt",
       "--dyt-hardening-fraction", "0.8"], "harddyt", "harddyt", 3),
+    (["--norm-type", "harddyt", "--qk-norm-type", "harddyt",
+      "--gelu-relu-ramp-fraction", "0.8"], "harddyt", "harddyt", 3),
 ])
 def test_train_adapt_export_smoke(tmp_path, capsys, norm_args, norm_type, qk_type, epochs):
     folder = tmp_path / "out"
@@ -27,14 +29,23 @@ def test_train_adapt_export_smoke(tmp_path, capsys, norm_args, norm_type, qk_typ
     assert teacher.norm_type == norm_type
     assert teacher.qk_norm is True
     assert teacher.qk_norm_type == qk_type
+    use_plain_relu = "--gelu-relu-ramp-fraction" in norm_args
+    assert teacher.ffn_activation == ("relu" if use_plain_relu else "gelu")
+    log = capsys.readouterr().out
     if "--dyt-hardening-fraction" in norm_args:
-        log = capsys.readouterr().out
         assert "best=pending hard_fraction=0.3000" in log
         assert "best=pending hard_fraction=0.7000" in log
         assert "hard_fraction=1.0000" in log
         checkpoint = torch.load(folder / "vit_teacher.pt", weights_only=True)
         assert checkpoint["epoch"] == epochs
         assert teacher.blocks[0].attn.q_norm.hard_fraction == 1.0
+    if use_plain_relu:
+        assert "best=pending relu_fraction=0.3000" in log
+        assert "best=pending relu_fraction=0.7000" in log
+        assert "relu_fraction=1.0000" in log
+        checkpoint = torch.load(folder / "vit_teacher.pt", weights_only=True)
+        assert checkpoint["epoch"] == epochs
+        assert isinstance(teacher.blocks[0].act, torch.nn.ReLU)
 
     main(["--stage", "adapt", "--finetune-epochs", "1", "--softmax-kind", "mlp", "--mlp-hidden", "6", "--mlp-fit-steps", "5", "--mlp-rows", "64", *shared])
     assert (folder / "vit_npu.pt").exists()
@@ -54,10 +65,17 @@ def test_train_adapt_export_smoke(tmp_path, capsys, norm_args, norm_type, qk_typ
     assert student.qk_norm_type == qk_type
     assert student.blocks[0].attn.norm.score_center == "mean"
     assert student.blocks[0].attn.norm.hidden == 6
+    if use_plain_relu:
+        log = capsys.readouterr().out
+        assert "plain ReLU" in log
+        assert "ReLU gain" not in log
+        assert isinstance(student.blocks[0].act, torch.nn.ReLU)
+        assert not ({"relu_gain", "relu_bias"} & first["pwl_specs"][0].keys())
 
     if norm_type == "rms":
-        # Older RMS checkpoints only stored the Q/K enable flag.
+        # Older RMS checkpoints omit the Q/K type and FFN activation.
         first["config"].pop("qk_norm_type")
+        first["config"].pop("ffn_activation")
         torch.save(first, folder / "vit_npu_latest.pt")
 
     # Resuming should complete epoch 2, keeping epoch 1 optimizer state.
@@ -80,6 +98,8 @@ def test_train_adapt_export_smoke(tmp_path, capsys, norm_args, norm_type, qk_typ
         if norm_type == "harddyt":
             ops = {node.op_type for node in onnx.load(folder / "vit_npu.onnx").graph.node}
             assert "Clip" in ops and "Tanh" not in ops
+            if use_plain_relu:
+                assert "Relu" in ops and not ({"Gelu", "Erf"} & ops)
 
 
 def test_data_only_cli(tmp_path):

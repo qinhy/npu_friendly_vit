@@ -12,6 +12,7 @@ from npu_friendly_vit import (
     export_onnx, audit_onnx, measure_saturation, patchify, patchify_np,
 )
 from npu_friendly_vit.train import save_student, load_student, load_teacher
+from npu_friendly_vit.model import GELUReLUBlend
 
 
 def tiny_teacher(norm_type="rms", qk_norm=True):
@@ -97,6 +98,24 @@ def test_harddyt_training_blend():
     torch.testing.assert_close(layer(x), torch.tanh(z))
     layer.set_hard_fraction(1)
     torch.testing.assert_close(layer(x), z.clamp(-1, 1))
+
+
+def test_gelu_relu_training_blend_and_plain_relu_transfer():
+    activation = GELUReLUBlend()
+    x = torch.tensor([-2.0, -0.5, 0.25, 1.0])
+    torch.testing.assert_close(activation(x), nn.functional.gelu(x))
+    activation.relu_fraction = 0.5
+    torch.testing.assert_close(activation(x), (nn.functional.gelu(x) + x.relu()) * 0.5)
+
+    teacher = StandardViT(dim=16, depth=1, heads=2, patch=8, ffn_activation="relu").eval()
+    student = convert_to_npu(teacher, [], softmax_kind="native", verbose=False)
+    folded = fold_affine_norms(student)
+    assert isinstance(student.blocks[0].act, nn.ReLU)
+    assert isinstance(folded.blocks[0].act, nn.ReLU)
+    torch.testing.assert_close(folded.blocks[0].fc2.weight, teacher.blocks[0].fc2.weight)
+    patches = patchify(calibration()[0], 8)
+    with torch.no_grad():
+        torch.testing.assert_close(folded(patches), teacher(patches), atol=2e-6, rtol=1e-5)
 
 
 @pytest.mark.parametrize("kind, norm_class, activation", [

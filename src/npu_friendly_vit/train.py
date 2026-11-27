@@ -36,12 +36,14 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 if __package__:
     from .model import (
         StandardViT, NPUViT, DynamicHardTanh, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax,
+        GELUReLUBlend,
         convert_to_npu, calibrate_npu, measure_saturation,
         audit_onnx, export_onnx, patchify, patchify_np, resolve_norm_mode,
     )
 else:
     from model import (
         StandardViT, NPUViT, DynamicHardTanh, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax,
+        GELUReLUBlend,
         convert_to_npu, calibrate_npu, measure_saturation,
         audit_onnx, export_onnx, patchify, patchify_np, resolve_norm_mode,
     )
@@ -124,7 +126,12 @@ def train_teacher(model, train_dl, val_dl, args, device, ckpt):
     warm = args.warmup * len(train_dl)
     ramp_steps = min(total - 1, math.ceil(total * args.dyt_hardening_fraction))
     harden_layers = [m for m in model.modules() if isinstance(m, DynamicHardTanh)] if ramp_steps > 0 else []
+    relu_ramp_steps = min(total - 1, math.ceil(total * args.gelu_relu_ramp_fraction))
+    if relu_ramp_steps > 0:
+        for block in model.blocks:
+            block.act = GELUReLUBlend()
     hard_fraction = 1.0
+    relu_fraction = 1.0
     best, step = -1, 0
     for epoch in range(args.epochs):
         model.train()
@@ -134,6 +141,13 @@ def train_teacher(model, train_dl, val_dl, args, device, ckpt):
                 hard_fraction = step / ramp_steps
                 for layer in harden_layers:
                     layer.set_hard_fraction(hard_fraction)
+            if relu_ramp_steps > 0 and step <= relu_ramp_steps:
+                relu_fraction = step / relu_ramp_steps
+                for block in model.blocks:
+                    if relu_fraction == 1.0:
+                        block.act = nn.ReLU()
+                    else:
+                        block.act.relu_fraction = relu_fraction
             lr = _schedule(args.lr, step, total, warm)
             for group in opt.param_groups:
                 group["lr"] = lr
@@ -147,16 +161,18 @@ def train_teacher(model, train_dl, val_dl, args, device, ckpt):
             loss_sum += loss.item()
             step += 1
         accuracy = evaluate(model, val_dl, device)
-        # Saved teachers load as pure HardDyT, so select them only at that endpoint.
-        if hard_fraction == 1.0 and accuracy > best:
+        # Checkpoints reconstruct the final activations.
+        if hard_fraction == relu_fraction == 1.0 and accuracy > best:
             best = accuracy
             torch.save({"config": model.config, "model": model.state_dict(),
                         "epoch": epoch + 1, "accuracy": best}, ckpt)
         best_label = f"{best:.4%}" if best >= 0 else "pending"
         hardening_label = f" hard_fraction={hard_fraction:.4f}" if harden_layers else ""
+        relu_label = f" relu_fraction={relu_fraction:.4f}" if relu_ramp_steps > 0 else ""
         print(f"[FP32] epoch {epoch+1:3d}/{args.epochs} "
               f"loss={loss_sum/len(train_dl):.4f} val_acc={accuracy:.4%} "
-              f"best={best_label}{hardening_label} time={time.monotonic()-start:.1f}s", flush=True)
+              f"best={best_label}{hardening_label}{relu_label} "
+              f"time={time.monotonic()-start:.1f}s", flush=True)
     return best
 
 
@@ -166,6 +182,7 @@ def _checkpoint_model_config(ckpt):
     if "norm_type" not in cfg:
         cfg.update(norm_type="ln", qk_norm=False)
     cfg.setdefault("qk_norm_type", "rms")
+    cfg.setdefault("ffn_activation", "gelu")
     return cfg
 
 
@@ -182,8 +199,11 @@ def _student_pwl_specs(model):
     specs = []
     for b in model.blocks:
         attn = b.attn.norm
-        spec = dict(relu_gain=b.act.gain.detach().cpu(),
-                    relu_bias=b.act.bias.detach().cpu())
+        spec = {}
+        if isinstance(b.act, CalibratedReLU):
+            spec.update(relu_gain=b.act.gain.detach().cpu(), relu_bias=b.act.bias.detach().cpu())
+        elif not isinstance(b.act, nn.ReLU):
+            raise TypeError(f"Student FFN activation is not ready to save: {type(b.act)}")
         if isinstance(attn, LearnedMLPSoftmax):
             spec.update(attn_kind="mlp", mlp_hidden=attn.hidden,
                         score_low=attn.low.detach().reshape(-1).cpu(),
@@ -236,7 +256,8 @@ def load_student(path, device):
     if len(ckpt["pwl_specs"]) != len(model.blocks):
         raise ValueError("Checkpoint attention specifications have wrong block count")
     for b, spec in zip(model.blocks, ckpt["pwl_specs"]):
-        b.act = CalibratedReLU(spec["relu_gain"], spec["relu_bias"])
+        if model.ffn_activation == "gelu":
+            b.act = CalibratedReLU(spec["relu_gain"], spec["relu_bias"])
         kind = spec.get("attn_kind", "pwl")  # legacy fixed-PWL checkpoints
         if kind == "mlp":
             b.attn.norm = LearnedMLPSoftmax(
@@ -531,6 +552,8 @@ def main(argv=None):
                    help="per-head Q/K transform during training when --qk-norm is enabled")
     p.add_argument("--dyt-hardening-fraction", type=float, default=0.0,
                    help="fraction of teacher steps for HardDyT to ramp from tanh to clip")
+    p.add_argument("--gelu-relu-ramp-fraction", type=float, default=0.0,
+                   help="fraction of teacher steps to ramp from GELU to plain ReLU")
     p.add_argument("--norm-mode", choices=["auto", "rms_matmul", "matmul", "affine", "pointwise"],
                    default="auto", help="student token norm implementation inferred from teacher by default")
     p.add_argument("--score-center", choices=["none", "mean", "max"], default="mean",
@@ -568,6 +591,10 @@ def main(argv=None):
             p.error("--dyt-hardening-fraction requires --stage train or all")
         if a.norm_type != "harddyt" and not (a.qk_norm and a.qk_norm_type == "harddyt"):
             p.error("--dyt-hardening-fraction requires at least one HardDyT site")
+    if not 0.0 <= a.gelu_relu_ramp_fraction < 1.0:
+        p.error("--gelu-relu-ramp-fraction must be in [0, 1)")
+    if a.gelu_relu_ramp_fraction > 0.0 and a.stage not in {"all", "train"}:
+        p.error("--gelu-relu-ramp-fraction requires --stage train or all")
     requested_norm_mode = None if a.norm_mode == "auto" else a.norm_mode
     if a.stage in {"all", "train"}:
         try:
@@ -595,7 +622,8 @@ def main(argv=None):
         teacher = StandardViT(dim=a.dim, depth=a.depth, heads=a.heads,
                               patch=a.patch, mlp_ratio=a.mlp_ratio,
                               norm_type=a.norm_type, qk_norm=a.qk_norm,
-                              qk_norm_type=a.qk_norm_type)
+                              qk_norm_type=a.qk_norm_type,
+                              ffn_activation="relu" if a.gelu_relu_ramp_fraction else "gelu")
         print(f"StandardViT: {sum(p.numel() for p in teacher.parameters()):,} parameters; "
               f"device={device}")
         train_teacher(teacher, train_dl, val_dl, a, device, teacher_path)
@@ -610,7 +638,8 @@ def main(argv=None):
     norm_mode = resolve_norm_mode(teacher.norm_type, requested_norm_mode)
     qk_type = teacher.qk_norm_type.upper() if teacher.qk_norm else "off"
     print(f"Teacher validation ({teacher.norm_type.upper()}+Q/K={qk_type}"
-          f"+GELU+Softmax): {teacher_acc:.4%}")
+          f"+{teacher.ffn_activation.upper()}+Softmax): {teacher_acc:.4%}")
+    use_plain_relu = teacher.ffn_activation == "relu"
     if a.resume_finetune:
         latest_path = Path(a.out) / "vit_npu_latest.pt"
         if not latest_path.is_file():
@@ -633,7 +662,8 @@ def main(argv=None):
                 raise ValueError("Resume PWL segments differ from checkpoint")
         print(f"Loaded NPU student from {latest_path} without recalibrating it.")
     else:
-        print(f"Converting norm={norm_mode}, GELU -> calibrated ReLU, "
+        activation_label = "plain ReLU" if use_plain_relu else "GELU -> calibrated ReLU"
+        print(f"Converting norm={norm_mode}, {activation_label}, "
               f"attention {a.softmax_kind}(center={a.score_center}, knots={a.knot_spacing})...")
         student = convert_to_npu(
             teacher, calib_dl, max_batches=a.calib_batches,
@@ -648,7 +678,8 @@ def main(argv=None):
         student_acc = evaluate(student, val_dl, device)
         print(f"Converted NPU ViT before fine-tune (validation): {student_acc:.4%}")
     finetune_student(student, teacher, train_dl, val_dl, a, device)
-    print("Refreshing calibrated ReLU and attention PWL after fine-tuning...")
+    refresh_label = "attention calibration" if use_plain_relu else "calibrated ReLU and attention"
+    print(f"Refreshing {refresh_label} after fine-tuning...")
     pre_refresh_val = evaluate(student, val_dl, device)
     before_refresh_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
     calibrate_npu(student, calib_dl, max_batches=a.calib_batches,

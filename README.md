@@ -1,11 +1,81 @@
 # DyT, HardDyT and RMSNorm ViT for Ryzen AI
 
-Train a floating-point ViT with your choice of normalization, GELU and exact Softmax,
-then convert it to an NPU-oriented student using **calibrated ReLU** and a
-**learned per-head six-neuron ReLU MLP in place of the Softmax exponential**.
+Train a floating-point ViT with configurable normalization and FFN
+activations, then export it to ONNX. **The recommended starting point for
+accelerator deployment is to use both training ramps and keep native
+Softmax.** This recipe preserved accuracy with the default CPU INT8
+quantization. Ryzen AI NPU execution and latency still need to be measured.
 
-To evaluate the exported graph on AMD XDNA1, check ONNX validity, INT8
-accuracy, and execution provider partitioning.
+## Recommended export recipe
+
+Ramp DyT to HardDyT at the block, final, and per-head Q/K sites. In parallel,
+ramp GELU to plain ReLU in the FFNs. With both fractions set to `0.8`, the
+last two of ten teacher epochs train with pure HardDyT and ReLU. Native
+Softmax stays active throughout. The exported student carries those trained
+activations through and skips ReLU and attention MLP calibration.
+
+Train and export from scratch in Windows Command Prompt.
+
+```cmd
+uv run npu-vit-train --stage all --epochs 10 --finetune-epochs 0 ^
+  --norm-type harddyt --qk-norm-type harddyt ^
+  --dyt-hardening-fraction 0.8 --gelu-relu-ramp-fraction 0.8 ^
+  --softmax-kind native --out out_harddyt_native
+```
+
+If you already trained a two-ramp teacher, reuse its checkpoint to export
+the native Softmax variant.
+
+```cmd
+uv run npu-vit-train --stage adapt ^
+  --teacher-ckpt out_harddyt_both_ramps/vit_teacher.pt ^
+  --softmax-kind native --finetune-epochs 0 --out out_harddyt_native
+```
+
+Quantize and benchmark on CPU with ONNX Runtime.
+
+```cmd
+uv run npu-vit-quantize --model out_harddyt_native/vit_npu.onnx ^
+  --data out_harddyt_native --quantizer ort --npu off --eval-n 2000 ^
+  --latency-runs 200 --report out_harddyt_native/ort_cpu_benchmark.json
+```
+
+### CIFAR-10 results
+
+The two-ramp teacher reached **62.32% validation accuracy**. On the full test
+set, the native Softmax export matched the teacher at **61.41%** with zero
+student fine-tuning epochs. The learned MLP student reached **62.31%** after
+three fine-tuning epochs. Both variants used byte-identical calibration and
+saved test arrays for the CPU quantization comparison.
+
+| Attention | FP32 accuracy on 2,000 images | INT8 accuracy on 2,000 images | INT8 change |
+|---|---:|---:|---:|
+| Native Softmax | 60.65% | **60.65%** | 0.00 pp |
+| Six-neuron learned MLP | 61.05% | 50.95% | −10.10 pp |
+
+Native Softmax averaged **4.21 ms in FP32** and **4.99 ms in INT8** at batch 1
+in this CPU run. The different fine-tuning budgets make the FP32-to-INT8
+change within each variant the more informative comparison.
+
+In the learned MLP, INT8 rounding erased small positive attention weights
+before row normalization. A 128-image probe found zero denominators in
+**9.7%** of final-block attention rows. Bypassing INT8 rounding for the small
+weights and row sums recovered **61.15%** accuracy on the 2,000-image subset.
+
+### Accelerator compatibility
+
+The native export uses ONNX opset 17 and exposes attention as
+`MatMul → scale → Softmax → MatMul`. HardDyT runs upstream on Q and K.
+TensorRT can fuse compatible graphs with this pattern. Standard ONNX
+introduced a dedicated `Attention` operator in opset 23, and the QNN
+execution provider lists it for opsets 23–24. Ryzen AI lists native
+`Softmax` for A16W8, A8W8, and XINT8 and documents a separate
+`GroupQueryAttention` path for ONNX Runtime GenAI. Check the target
+compiler's partition report for operator placement and its compiled graph
+or build logs for attention fusion. [TensorRT fused attention](https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/transformers-fused-attention.html),
+[ONNX Attention](https://onnx.ai/onnx/operators/onnx__Attention.html#attention-23),
+[QNN operator support](https://github.com/onnxruntime/onnxruntime-qnn/blob/main/docs/execution_providers/QNN-ExecutionProvider.md),
+[Ryzen AI operator support](https://ryzenai.docs.amd.com/en/latest/ops_support.html)
 
 ## Design
 
@@ -13,11 +83,10 @@ accuracy, and execution provider partitioning.
 |---|---|---|
 | Block and final normalization | RMSNorm (default), LayerNorm, DyT, or HardDyT | constant-MatMul RMSNorm, LayerNorm export, or the trained pointwise activation |
 | Query and Key | per-head RMSNorm (default), DyT, HardDyT, or disabled | constant-MatMul RMSNorm, the trained pointwise activation, or passthrough |
-| Activation | GELU | calibrated `gain * ReLU + bias`; gain/bias folded into `fc2` |
+| FFN activation | GELU, or a ramp from GELU to ReLU | calibrated ReLU for GELU teachers, plain ReLU for ramp-trained teachers |
 | Attention scores | `Q @ K.T / sqrt(d)` | unchanged |
-| Attention normalization | exact Softmax | **learned six-neuron ReLU MLP + sum/division** (default) |
-| Other attention choices | — | fixed 12-segment PWL (`pwl`) or native Softmax (`native`) |
-| Row centering | internal to Softmax | mean via constant MatMul (default), optional max/none |
+| Attention normalization | exact Softmax | native Softmax (recommended here), learned six-neuron ReLU MLP (CLI default), or fixed 12-segment PWL |
+| Row centering | internal to Softmax | approximate attention defaults to mean via constant MatMul, with optional max/none |
 
 ### Learned six-neuron MLP
 
@@ -100,6 +169,26 @@ specified fraction of optimizer steps. With 10 epochs and a fraction of
 `0.8`, the last two epochs use pure HardDyT. Checkpoint selection starts
 once the blend reaches 1. Student calibration, fine-tuning, and export then
 use pure HardDyT. The default fraction of `0` uses HardDyT from the first step.
+
+### Gradually switch the FFN from GELU to ReLU
+
+```bash
+uv run npu-vit-train --stage all --epochs 10 --finetune-epochs 3 \
+  --norm-type harddyt --qk-norm-type harddyt --gelu-relu-ramp-fraction 0.8 \
+  --softmax-kind mlp --score-center mean --out out_harddyt_relu_ramp
+```
+
+The teacher uses `(1 - t) * GELU(x) + t * ReLU(x)` in each FFN, increasing
+`t` linearly from 0 to 1 over the first 80% of optimizer steps. With 10
+epochs, it trains with plain ReLU for the final two epochs and selects
+checkpoints from that phase. Adaptation keeps the teacher's plain ReLU
+and calibrates the attention MLP using attention scores from the
+ReLU model. The option can also be used with `--stage train` and a separate
+`--stage adapt` run, which reads the FFN activation from the teacher checkpoint.
+
+Omit the flag to train the GELU teacher and use the original calibrated
+ReLU conversion. The example uses HardDyT throughout so it can be
+compared with the all-HardDyT run that uses calibrated ReLU.
 
 ## Vectorized inference (no per-neuron `for` loop)
 
@@ -262,8 +351,7 @@ uv run npu-vit-train --stage adapt \
   --score-center mean --knot-spacing geometric --finetune-epochs 10
 ```
 
-**Native Softmax**, as the hardware/compiler reference (exports a native
-`Softmax` node; does NOT try to eliminate it):
+**Native Softmax**, as the hardware/compiler reference for an RMSNorm teacher.
 
 ```bash
 uv run npu-vit-train --stage adapt \
@@ -271,10 +359,9 @@ uv run npu-vit-train --stage adapt \
   --softmax-kind native --finetune-epochs 10
 ```
 
-Compare all three on the same validation/test split: teacher/student accuracy,
-attention KL, clipped-score rates, post-quantization accuracy, median batch-1
-latency, and NPU vs CPU assignment. A learned six-neuron model is **not
-necessarily** faster or more accurate than an optimized native Softmax.
+Use the same validation and test splits to compare accuracy before and after
+quantization, mean batch-1 latency, and operator placement across CPU and NPU.
+For approximate attention, also compare attention KL and clipped-score rates.
 
 ## Quick smoke tests (no dataset downloads)
 
@@ -306,6 +393,5 @@ pyproject.toml
 The test suite checks RMSNorm and QK-Norm equivalence, learned-MLP
 probability normalization and fitting, old fixed-PWL and native branches,
 ReLU folding, checkpoint persistence/resume, and smoke training. Optional
-`onnx` and `onnxruntime` are required to validate the actual ONNX graph;
-without them those tests skip. We have not measured real CIFAR-10 or NPU
-inference results for the learned-MLP student.
+`onnx` and `onnxruntime` enable ONNX graph and runtime validation. See
+[CIFAR-10 results](#cifar-10-results) for the measured CPU comparison.

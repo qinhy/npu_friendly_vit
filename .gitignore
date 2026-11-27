@@ -188,3 +188,5 @@ vaip_cache/
 *.pt
 out_mlp6/
 /out_harddyt
+/out_harddyt_both_ramps
+/out_harddyt_native
