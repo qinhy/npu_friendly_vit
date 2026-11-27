@@ -85,6 +85,20 @@ def test_norm_and_qk_conversion_no_calibration_error():
     assert student.norm_mode == "rms_matmul"
 
 
+def test_harddyt_training_blend():
+    layer = DynamicHardTanh(3, hard_fraction=0.5)
+    x = torch.tensor([-4.0, 1.0, 2.0], requires_grad=True)
+    z = layer.alpha.detach() * x.detach()
+    expected = 0.5 * torch.tanh(z) + 0.5 * z.clamp(-1, 1)
+    torch.testing.assert_close(layer(x), expected)
+    layer(x).sum().backward()
+    assert x.grad[0] > 0  # Tanh still carries a gradient outside the clip range.
+    layer.set_hard_fraction(0)
+    torch.testing.assert_close(layer(x), torch.tanh(z))
+    layer.set_hard_fraction(1)
+    torch.testing.assert_close(layer(x), z.clamp(-1, 1))
+
+
 @pytest.mark.parametrize("kind, norm_class, activation", [
     ("dyt", DynamicTanh, torch.tanh),
     ("harddyt", DynamicHardTanh, lambda x: x.clamp(-1, 1)),

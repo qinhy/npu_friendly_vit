@@ -6,11 +6,13 @@ import torch
 from npu_friendly_vit.train import load_student, load_teacher, main
 
 
-@pytest.mark.parametrize("norm_args, norm_type, qk_type", [
-    ([], "rms", "rms"),
-    (["--norm-type", "harddyt", "--qk-norm-type", "harddyt"], "harddyt", "harddyt"),
+@pytest.mark.parametrize("norm_args, norm_type, qk_type, epochs", [
+    ([], "rms", "rms", 1),
+    (["--norm-type", "harddyt", "--qk-norm-type", "harddyt"], "harddyt", "harddyt", 1),
+    (["--norm-type", "harddyt", "--qk-norm-type", "harddyt",
+      "--dyt-hardening-fraction", "0.8"], "harddyt", "harddyt", 3),
 ])
-def test_train_adapt_export_smoke(tmp_path, norm_args, norm_type, qk_type):
+def test_train_adapt_export_smoke(tmp_path, capsys, norm_args, norm_type, qk_type, epochs):
     folder = tmp_path / "out"
     shared = [
         "--fake-data", "--fake-samples", "48", "--batch", "12", "--workers", "0",
@@ -18,13 +20,21 @@ def test_train_adapt_export_smoke(tmp_path, norm_args, norm_type, qk_type):
         "--warmup", "0", "--calib-samples", "24", "--calib-batch", "8",
         "--val-samples", "8", "--out", str(folder),
     ]
-    main(["--stage", "train", "--epochs", "1", *norm_args, *shared])
+    main(["--stage", "train", "--epochs", str(epochs), *norm_args, *shared])
     assert (folder / "vit_teacher.pt").exists()
     teacher = load_teacher(folder / "vit_teacher.pt", "cpu")
     assert teacher.n_tokens == 16
     assert teacher.norm_type == norm_type
     assert teacher.qk_norm is True
     assert teacher.qk_norm_type == qk_type
+    if "--dyt-hardening-fraction" in norm_args:
+        log = capsys.readouterr().out
+        assert "best=pending hard_fraction=0.3000" in log
+        assert "best=pending hard_fraction=0.7000" in log
+        assert "hard_fraction=1.0000" in log
+        checkpoint = torch.load(folder / "vit_teacher.pt", weights_only=True)
+        assert checkpoint["epoch"] == epochs
+        assert teacher.blocks[0].attn.q_norm.hard_fraction == 1.0
 
     main(["--stage", "adapt", "--finetune-epochs", "1", "--softmax-kind", "mlp", "--mlp-hidden", "6", "--mlp-fit-steps", "5", "--mlp-rows", "64", *shared])
     assert (folder / "vit_npu.pt").exists()
@@ -62,11 +72,14 @@ def test_train_adapt_export_smoke(tmp_path, norm_args, norm_type, qk_type):
 
     main(["--stage", "export", "--out", str(folder)])
     try:
-        import onnx  # noqa: F401
+        import onnx
     except ImportError:
         assert not (folder / "vit_npu.onnx").exists()
     else:
         assert (folder / "vit_npu.onnx").exists()
+        if norm_type == "harddyt":
+            ops = {node.op_type for node in onnx.load(folder / "vit_npu.onnx").graph.node}
+            assert "Clip" in ops and "Tanh" not in ops
 
 
 def test_data_only_cli(tmp_path):

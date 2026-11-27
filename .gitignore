@@ -187,3 +187,4 @@ vaip_cache/
 *.onnx
 *.pt
 out_mlp6/
+/out_harddyt

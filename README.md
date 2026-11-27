@@ -85,6 +85,22 @@ consuming projections, including the final classifier. HardDyT uses ONNX
 exported graph avoids `Tanh`, `Exp`, `Sqrt`, `Rsqrt`, `ReduceMean`, and
 `ReduceMax`. Check `Clip` support and partitioning on the target NPU.
 
+### Gradually switch from DyT to HardDyT
+
+```bash
+uv run npu-vit-train --stage all --epochs 10 --finetune-epochs 3 \
+  --norm-type harddyt --qk-norm-type harddyt --dyt-hardening-fraction 0.8 \
+  --softmax-kind mlp --score-center mean --out out_harddyt_ramp
+```
+
+At each selected HardDyT site, teacher training uses
+`(1 - t) * tanh(alpha * x) + t * clip(alpha * x, -1, 1)` before the learned
+output affine. The clip weight `t` increases linearly from 0 to 1 over the
+specified fraction of optimizer steps. With 10 epochs and a fraction of
+`0.8`, the last two epochs use pure HardDyT. Checkpoint selection starts
+once the blend reaches 1. Student calibration, fine-tuning, and export then
+use pure HardDyT. The default fraction of `0` uses HardDyT from the first step.
+
 ## Vectorized inference (no per-neuron `for` loop)
 
 The previous implementation constructed six separate ReLU branches in a Python

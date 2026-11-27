@@ -35,13 +35,13 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 
 if __package__:
     from .model import (
-        StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax,
+        StandardViT, NPUViT, DynamicHardTanh, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax,
         convert_to_npu, calibrate_npu, measure_saturation,
         audit_onnx, export_onnx, patchify, patchify_np, resolve_norm_mode,
     )
 else:
     from model import (
-        StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax,
+        StandardViT, NPUViT, DynamicHardTanh, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax,
         convert_to_npu, calibrate_npu, measure_saturation,
         audit_onnx, export_onnx, patchify, patchify_np, resolve_norm_mode,
     )
@@ -122,11 +122,18 @@ def train_teacher(model, train_dl, val_dl, args, device, ckpt):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     total = args.epochs * len(train_dl)
     warm = args.warmup * len(train_dl)
+    ramp_steps = min(total - 1, math.ceil(total * args.dyt_hardening_fraction))
+    harden_layers = [m for m in model.modules() if isinstance(m, DynamicHardTanh)] if ramp_steps > 0 else []
+    hard_fraction = 1.0
     best, step = -1, 0
     for epoch in range(args.epochs):
         model.train()
         loss_sum, start = 0, time.monotonic()
         for images, labels in train_dl:
+            if harden_layers and step <= ramp_steps:
+                hard_fraction = step / ramp_steps
+                for layer in harden_layers:
+                    layer.set_hard_fraction(hard_fraction)
             lr = _schedule(args.lr, step, total, warm)
             for group in opt.param_groups:
                 group["lr"] = lr
@@ -140,13 +147,16 @@ def train_teacher(model, train_dl, val_dl, args, device, ckpt):
             loss_sum += loss.item()
             step += 1
         accuracy = evaluate(model, val_dl, device)
-        if accuracy > best:
+        # Saved teachers load as pure HardDyT, so select them only at that endpoint.
+        if hard_fraction == 1.0 and accuracy > best:
             best = accuracy
             torch.save({"config": model.config, "model": model.state_dict(),
                         "epoch": epoch + 1, "accuracy": best}, ckpt)
+        best_label = f"{best:.4%}" if best >= 0 else "pending"
+        hardening_label = f" hard_fraction={hard_fraction:.4f}" if harden_layers else ""
         print(f"[FP32] epoch {epoch+1:3d}/{args.epochs} "
               f"loss={loss_sum/len(train_dl):.4f} val_acc={accuracy:.4%} "
-              f"best={best:.4%} time={time.monotonic()-start:.1f}s", flush=True)
+              f"best={best_label}{hardening_label} time={time.monotonic()-start:.1f}s", flush=True)
     return best
 
 
@@ -519,6 +529,8 @@ def main(argv=None):
                    help="enable independent per-head transforms on Q and K")
     p.add_argument("--qk-norm-type", choices=["rms", "dyt", "harddyt"], default="rms",
                    help="per-head Q/K transform during training when --qk-norm is enabled")
+    p.add_argument("--dyt-hardening-fraction", type=float, default=0.0,
+                   help="fraction of teacher steps for HardDyT to ramp from tanh to clip")
     p.add_argument("--norm-mode", choices=["auto", "rms_matmul", "matmul", "affine", "pointwise"],
                    default="auto", help="student token norm implementation inferred from teacher by default")
     p.add_argument("--score-center", choices=["none", "mean", "max"], default="mean",
@@ -549,6 +561,13 @@ def main(argv=None):
         p.error("Invalid learned-MLP fitting settings")
     if a.resume_finetune and a.stage != "adapt":
         p.error("--resume-finetune is only valid for --stage adapt")
+    if not 0.0 <= a.dyt_hardening_fraction < 1.0:
+        p.error("--dyt-hardening-fraction must be in [0, 1)")
+    if a.dyt_hardening_fraction > 0.0:
+        if a.stage not in {"all", "train"}:
+            p.error("--dyt-hardening-fraction requires --stage train or all")
+        if a.norm_type != "harddyt" and not (a.qk_norm and a.qk_norm_type == "harddyt"):
+            p.error("--dyt-hardening-fraction requires at least one HardDyT site")
     requested_norm_mode = None if a.norm_mode == "auto" else a.norm_mode
     if a.stage in {"all", "train"}:
         try:

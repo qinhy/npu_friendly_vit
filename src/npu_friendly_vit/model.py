@@ -121,9 +121,24 @@ class DynamicTanh(nn.Module):
 
 
 class DynamicHardTanh(DynamicTanh):
-    """DyT with a fixed [-1, 1] clip in place of tanh."""
+    """DyT with a fixed [-1, 1] clip and an optional training blend."""
 
-    activation = staticmethod(F.hardtanh)
+    def __init__(self, dim: int, *, heads: int | None = None, hard_fraction: float = 1.0):
+        super().__init__(dim, heads=heads)
+        self.set_hard_fraction(hard_fraction)
+
+    def set_hard_fraction(self, fraction: float) -> None:
+        """Set the clip weight in the blend. This training setting is transient."""
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError("hard_fraction must be between 0 and 1")
+        self.hard_fraction = float(fraction)
+
+    def activation(self, x):
+        if self.hard_fraction == 1.0:
+            return F.hardtanh(x)
+        if self.hard_fraction == 0.0:
+            return torch.tanh(x)
+        return torch.lerp(torch.tanh(x), F.hardtanh(x), self.hard_fraction)
 
 
 POINTWISE_NORMS = {"dyt": DynamicTanh, "harddyt": DynamicHardTanh}
