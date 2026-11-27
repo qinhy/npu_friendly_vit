@@ -1,11 +1,16 @@
 """Exercise the CLI stages without needing CIFAR downloads or an NPU."""
 
+import pytest
 import torch
 
 from npu_friendly_vit.train import load_student, load_teacher, main
 
 
-def test_train_adapt_export_smoke(tmp_path):
+@pytest.mark.parametrize("norm_args, norm_type, qk_type", [
+    ([], "rms", "rms"),
+    (["--norm-type", "harddyt", "--qk-norm-type", "harddyt"], "harddyt", "harddyt"),
+])
+def test_train_adapt_export_smoke(tmp_path, norm_args, norm_type, qk_type):
     folder = tmp_path / "out"
     shared = [
         "--fake-data", "--fake-samples", "48", "--batch", "12", "--workers", "0",
@@ -13,12 +18,13 @@ def test_train_adapt_export_smoke(tmp_path):
         "--warmup", "0", "--calib-samples", "24", "--calib-batch", "8",
         "--val-samples", "8", "--out", str(folder),
     ]
-    main(["--stage", "train", "--epochs", "1", *shared])
+    main(["--stage", "train", "--epochs", "1", *norm_args, *shared])
     assert (folder / "vit_teacher.pt").exists()
     teacher = load_teacher(folder / "vit_teacher.pt", "cpu")
     assert teacher.n_tokens == 16
-    assert teacher.norm_type == "rms"
+    assert teacher.norm_type == norm_type
     assert teacher.qk_norm is True
+    assert teacher.qk_norm_type == qk_type
 
     main(["--stage", "adapt", "--finetune-epochs", "1", "--softmax-kind", "mlp", "--mlp-hidden", "6", "--mlp-fit-steps", "5", "--mlp-rows", "64", *shared])
     assert (folder / "vit_npu.pt").exists()
@@ -33,10 +39,16 @@ def test_train_adapt_export_smoke(tmp_path):
     assert (folder / "test_y.npy").exists()
     student = load_student(folder / "vit_npu.pt", "cpu")
     assert student.n_tokens == 16
-    assert student.norm_type == "rms"
+    assert student.norm_type == norm_type
     assert student.qk_norm is True
+    assert student.qk_norm_type == qk_type
     assert student.blocks[0].attn.norm.score_center == "mean"
     assert student.blocks[0].attn.norm.hidden == 6
+
+    if norm_type == "rms":
+        # Older RMS checkpoints only stored the Q/K enable flag.
+        first["config"].pop("qk_norm_type")
+        torch.save(first, folder / "vit_npu_latest.pt")
 
     # Resuming should complete epoch 2, keeping epoch 1 optimizer state.
     main(["--stage", "adapt", "--resume-finetune",

@@ -1,19 +1,18 @@
-# RMSNorm + QK-Norm ViT — learned six-neuron Softmax for Ryzen AI
+# DyT, HardDyT and RMSNorm ViT for Ryzen AI
 
-Train a normal floating-point ViT (`RMSNorm + QK-Norm + GELU + exact Softmax`),
+Train a floating-point ViT with your choice of normalization, GELU and exact Softmax,
 then convert it to an NPU-oriented student using **calibrated ReLU** and a
 **learned per-head six-neuron ReLU MLP in place of the Softmax exponential**.
 
-The output is a research graph, **not** a guarantee of complete AMD XDNA1
-NPU execution. ONNX graph validation, INT8 calibration, accuracy and execution
-provider partitioning are distinct tests.
+To evaluate the exported graph on AMD XDNA1, check ONNX validity, INT8
+accuracy, and execution provider partitioning.
 
 ## Design
 
 | Component | FP32 teacher | NPU-oriented student |
 |---|---|---|
-| Token normalization | RMSNorm | equivalent constant-MatMul RMSNorm |
-| Query and Key | per-head RMSNorm | equivalent constant-MatMul QK-Norm |
+| Block and final normalization | RMSNorm (default), LayerNorm, DyT, or HardDyT | constant-MatMul RMSNorm, LayerNorm export, or the trained pointwise activation |
+| Query and Key | per-head RMSNorm (default), DyT, HardDyT, or disabled | constant-MatMul RMSNorm, the trained pointwise activation, or passthrough |
 | Activation | GELU | calibrated `gain * ReLU + bias`; gain/bias folded into `fc2` |
 | Attention scores | `Q @ K.T / sqrt(d)` | unchanged |
 | Attention normalization | exact Softmax | **learned six-neuron ReLU MLP + sum/division** (default) |
@@ -52,8 +51,39 @@ learnable during global fine-tuning by default, or can be held fixed with
 **Inference does not calculate exponential or row-wise max** when using
 `--softmax-kind mlp --score-center mean`. The exported ONNX model uses basic
 `Add`, `Sub`, `Mul`, `Relu`, `Max`, `Min`, `MatMul`, `Div`, etc. It still has
-`Sqrt`/`Div` in the dynamic RMSNorm/QK-Norm decomposition. Verify the actual
-NPU/CPU partitioning rather than assuming speed gains.
+`Sqrt`/`Div` when it includes dynamic RMSNorm or QK-RMSNorm. The DyT options
+below change both normalization sites independently.
+
+## Train and export with DyT or HardDyT
+
+```bash
+uv run npu-vit-train --stage all --norm-type harddyt --qk-norm-type harddyt \
+  --softmax-kind mlp --score-center mean --out out_harddyt
+```
+
+`--norm-type` selects the transforms before attention, before the feed-forward
+network, and before final pooling. `--qk-norm-type` selects the transforms on
+the projected queries and keys. Each Q and K head learns an independent
+input scale and channel affine. Pointwise layers initialize the input scale
+to `0.5`, gain to `1`, and bias to `0`.
+
+Use `--norm-type dyt --qk-norm-type rms` to test smooth DyT at the token sites.
+Use `--norm-type harddyt --qk-norm-type rms` to test clipping at those same
+sites. Compare against `--norm-type harddyt --qk-norm-type harddyt` to measure
+the additional effect of changing Q/K. Choose `--softmax-kind native` to
+hold exact Softmax fixed for those comparisons. `--no-qk-norm` bypasses the
+Q/K transforms entirely.
+
+Train a teacher for each normalization configuration. With separate `train`
+and `adapt` runs, pass the teacher checkpoint to `adapt` and leave
+`--norm-mode` at `auto`. The checkpoint records both normalization choices.
+
+During export, Q/K input scales fold into the Q/K projection weights and
+biases. The token transforms' output gains and offsets fold into their
+consuming projections, including the final classifier. HardDyT uses ONNX
+`Clip`. With HardDyT at both sites and mean-centered MLP attention, the
+exported graph avoids `Tanh`, `Exp`, `Sqrt`, `Rsqrt`, `ReduceMean`, and
+`ReduceMax`. Check `Clip` support and partitioning on the target NPU.
 
 ## Vectorized inference (no per-neuron `for` loop)
 

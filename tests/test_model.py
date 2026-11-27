@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from npu_friendly_vit import (
     TokenRMSNorm, MatMulRMSNorm, HeadRMSNorm, MatMulHeadRMSNorm,
+    DynamicTanh, DynamicHardTanh,
     MatMulLayerNorm, StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax, fit_mlp_softmax,
     fit_static_norms, convert_to_npu, calibrate_npu, fold_affine_norms,
     export_onnx, audit_onnx, measure_saturation, patchify, patchify_np,
@@ -84,6 +85,69 @@ def test_norm_and_qk_conversion_no_calibration_error():
     assert student.norm_mode == "rms_matmul"
 
 
+@pytest.mark.parametrize("kind, norm_class, activation", [
+    ("dyt", DynamicTanh, torch.tanh),
+    ("harddyt", DynamicHardTanh, lambda x: x.clamp(-1, 1)),
+])
+def test_pointwise_norm_transfer_and_folding(kind, norm_class, activation):
+    torch.manual_seed(32)
+    teacher = StandardViT(dim=16, depth=1, heads=2, patch=8,
+                          norm_type=kind, qk_norm_type=kind).eval()
+    norms = [norm for norm in teacher.modules() if type(norm) is norm_class]
+    assert len(norms) == 5  # two block sites, Q, K, and final norm
+    with torch.no_grad():
+        for norm in norms:
+            norm.weight.uniform_(-1, 2)
+            norm.bias.uniform_(-0.5, 0.5)
+            if norm.heads is None:
+                norm.alpha.fill_(0.9)
+            else:
+                norm.alpha.copy_(torch.tensor([0.75, -1.25]))
+    q_norm = teacher.blocks[0].attn.q_norm
+    x = torch.randn(3, 2, 5, 8) * 2
+    y = q_norm(x)
+    expected = activation(x * q_norm.alpha[:, None, None])
+    expected = expected * q_norm.weight[:, None, :] + q_norm.bias[:, None, :]
+    torch.testing.assert_close(y, expected)
+    y.square().mean().backward()
+    assert (q_norm.alpha.grad.abs() > 0).all()
+
+    calib = calibration()
+    patches = patchify(calib[0], 8)
+    student = fit_static_norms(teacher, calib)
+    assert student.norm_mode == "pointwise"
+    with torch.no_grad():
+        torch.testing.assert_close(student(patches), teacher(patches))
+        calibrate_npu(student, calib, softmax_kind="native", verbose=False)
+        folded = fold_affine_norms(student)
+        torch.testing.assert_close(folded(patches), student(patches), atol=2e-6, rtol=1e-5)
+    assert folded.blocks[0].attn.q_norm.alpha is None
+    assert folded.blocks[0].attn.k_norm.alpha is None
+    assert folded.blocks[0].norm1.weight is None
+    assert folded.norm.weight is None
+    assert student.blocks[0].attn.q_norm.alpha is not None
+
+
+def test_harddyt_export_operators_and_ort_parity(tmp_path):
+    pytest.importorskip("onnx")
+    ort = pytest.importorskip("onnxruntime")
+    teacher = StandardViT(dim=16, depth=1, heads=2, patch=8,
+                          norm_type="harddyt", qk_norm_type="harddyt").eval()
+    calib = calibration()
+    student = convert_to_npu(teacher, calib, softmax_kind="mlp", mlp_fit_steps=0, verbose=False)
+    path = tmp_path / "harddyt.onnx"
+    export_onnx(student, path)
+    ops = audit_onnx(path)
+    assert ops["Clip"] == 5
+    assert not ({"Tanh", "Sqrt", "Rsqrt", "ReduceMean", "ReduceMax"} & ops.keys())
+    patches = patchify(calib[0][:1], 8)
+    sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    with torch.no_grad():
+        expected = student(patches).numpy()
+    np.testing.assert_allclose(sess.run(None, {"input": patches.numpy()})[0],
+                               expected, atol=4e-4, rtol=4e-4)
+
+
 def test_pwl_no_row_max_mean_center_and_geometric_knots():
     low = torch.full((4,), -9.0)
     high = torch.full((4,), 9.0)
@@ -140,6 +204,7 @@ def test_legacy_ln_branch_and_checkpoint(tmp_path):
     old_cfg = dict(teacher.config)
     old_cfg.pop("norm_type")
     old_cfg.pop("qk_norm")
+    old_cfg.pop("qk_norm_type")
     torch.save({"config": old_cfg, "model": teacher.state_dict()}, ckpt)
     legacy = load_teacher(ckpt, "cpu")
     assert legacy.norm_type == "ln"

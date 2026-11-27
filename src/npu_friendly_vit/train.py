@@ -1,4 +1,4 @@
-"""CIFAR-10 RMSNorm + QK-Norm ViT -> calibrated & fine-tuned NPU ViT.
+"""CIFAR-10 ViT training and conversion to an NPU-oriented student.
 
 Run from the repo (the package import is preferred):
   uv run npu-vit-train --stage all --epochs 100 --finetune-epochs 10
@@ -8,8 +8,8 @@ Or run alongside model.py:
       --dim 32 --depth 1 --heads 4 --patch 8 --workers 0
 
 Stages:
-  train   : train RMSNorm/QK-Norm ViT with GELU/Softmax, save teacher
-  adapt   : load teacher, retain RMSNorm/QK-Norm via MatMul, calibrate ReLU/MLP Softmax, distill,
+  train   : train ViT with configurable token and Q/K norms, GELU and Softmax
+  adapt   : load teacher, transfer norms, calibrate ReLU/MLP Softmax, distill,
             recalibrate, save NPU checkpoint/ONNX and test arrays
   export  : load already adapted NPU checkpoint and export ONNX
   data    : generate calib.npy/test_x.npy/test_y.npy without training
@@ -37,13 +37,13 @@ if __package__:
     from .model import (
         StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax,
         convert_to_npu, calibrate_npu, measure_saturation,
-        audit_onnx, export_onnx, patchify, patchify_np,
+        audit_onnx, export_onnx, patchify, patchify_np, resolve_norm_mode,
     )
 else:
     from model import (
         StandardViT, NPUViT, CalibratedReLU, FixedPWLSoftmax, LearnedMLPSoftmax,
         convert_to_npu, calibrate_npu, measure_saturation,
-        audit_onnx, export_onnx, patchify, patchify_np,
+        audit_onnx, export_onnx, patchify, patchify_np, resolve_norm_mode,
     )
 
 MEAN = (0.4914, 0.4822, 0.4465)
@@ -150,13 +150,18 @@ def train_teacher(model, train_dl, val_dl, args, device, ckpt):
     return best
 
 
-def load_teacher(path, device):
-    ckpt = torch.load(path, map_location=device, weights_only=True)
-    # Older checkpoints predate RMSNorm/QK-Norm. Treat those as LayerNorm
-    # teachers; RMS+QK cannot be introduced by simply loading an LN checkpoint.
+def _checkpoint_model_config(ckpt):
+    # Checkpoints predating RMSNorm used LayerNorm with no Q/K transform.
     cfg = dict(ckpt["config"])
     if "norm_type" not in cfg:
         cfg.update(norm_type="ln", qk_norm=False)
+    cfg.setdefault("qk_norm_type", "rms")
+    return cfg
+
+
+def load_teacher(path, device):
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+    cfg = _checkpoint_model_config(ckpt)
     teacher = StandardViT(**cfg).to(device)
     teacher.load_state_dict(ckpt["model"])
     return teacher.eval()
@@ -216,9 +221,7 @@ def save_student(model, path, accuracy=None, *, extra=None):
 
 def load_student(path, device):
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    cfg = dict(ckpt["config"])
-    if "norm_type" not in cfg:
-        cfg.update(norm_type="ln", qk_norm=False)
+    cfg = _checkpoint_model_config(ckpt)
     model = NPUViT(**cfg, norm_mode=ckpt.get("norm_mode", "affine"))
     if len(ckpt["pwl_specs"]) != len(model.blocks):
         raise ValueError("Checkpoint attention specifications have wrong block count")
@@ -339,8 +342,10 @@ def finetune_student(student, teacher, train_dl, val_dl, args, device):
             raise FileNotFoundError(
                 "Resume requires vit_npu_latest.pt and vit_npu_best.pt in --out"
             )
-        checkpoint = torch.load(latest_path, map_location=device, weights_only=True)
-        if checkpoint["config"] != student.config or checkpoint["norm_mode"] != student.norm_mode:
+        # CUDA RNG byte tensors must be restored from CPU.
+        checkpoint = torch.load(latest_path, map_location="cpu", weights_only=True)
+        if (_checkpoint_model_config(checkpoint) != student.config or
+                checkpoint["norm_mode"] != student.norm_mode):
             raise ValueError("Saved fine-tuning checkpoint has an incompatible architecture")
         student.load_state_dict(checkpoint["model"])
         if _load_optimizer_compat(opt, checkpoint["optimizer"], student):
@@ -471,8 +476,8 @@ def do_export(model, args):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--stage", choices=["all", "train", "adapt", "export", "data"], default="all")
-    p.add_argument("--epochs", type=int, default=100, help="standard ViT training epochs")
-    p.add_argument("--finetune-epochs", type=int, default=10,
+    p.add_argument("--epochs", type=int, default=10, help="standard ViT training epochs")
+    p.add_argument("--finetune-epochs", type=int, default=3,
                    help="total fine-tuning epochs, including epochs already completed when resuming")
     p.add_argument("--resume-finetune", action="store_true",
                    help="resume model and AdamW state from --out/vit_npu_latest.pt")
@@ -508,12 +513,14 @@ def main(argv=None):
     p.add_argument("--mlp-freeze-after-fit", action="store_true",
                    help="do not train learned MLP coefficients in global student fine-tuning")
     p.add_argument("--softmax-segments", type=int, default=12)
-    p.add_argument("--norm-type", choices=["rms", "ln"], default="rms",
-                   help="training normalization: rms is the new default; ln is the legacy baseline")
+    p.add_argument("--norm-type", choices=["rms", "ln", "dyt", "harddyt"], default="rms",
+                   help="activation at block and final normalization sites during training")
     p.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=True,
-                   help="use independent per-head RMSNorm on Q and K before attention")
-    p.add_argument("--norm-mode", choices=["auto", "rms_matmul", "matmul", "affine"],
-                   default="auto", help="auto: rms_matmul for RMS, matmul for legacy LN")
+                   help="enable independent per-head transforms on Q and K")
+    p.add_argument("--qk-norm-type", choices=["rms", "dyt", "harddyt"], default="rms",
+                   help="per-head Q/K transform during training when --qk-norm is enabled")
+    p.add_argument("--norm-mode", choices=["auto", "rms_matmul", "matmul", "affine", "pointwise"],
+                   default="auto", help="student token norm implementation inferred from teacher by default")
     p.add_argument("--score-center", choices=["none", "mean", "max"], default="mean",
                    help="mean avoids ReduceMax; max is more numerically robust")
     p.add_argument("--knot-spacing", choices=["uniform", "geometric"],
@@ -542,11 +549,12 @@ def main(argv=None):
         p.error("Invalid learned-MLP fitting settings")
     if a.resume_finetune and a.stage != "adapt":
         p.error("--resume-finetune is only valid for --stage adapt")
-    if a.norm_mode != "auto" and ((a.norm_type == "rms" and a.norm_mode != "rms_matmul") or
-                                  (a.norm_type == "ln" and a.norm_mode == "rms_matmul")):
-        # For adapt, checkpoint norm_type controls the actual teacher; validated again below.
-        if a.stage in {"all", "train"}:
-            p.error("--norm-mode is incompatible with --norm-type")
+    requested_norm_mode = None if a.norm_mode == "auto" else a.norm_mode
+    if a.stage in {"all", "train"}:
+        try:
+            resolve_norm_mode(a.norm_type, requested_norm_mode)
+        except ValueError as exc:
+            p.error(str(exc))
     Path(a.out).mkdir(parents=True, exist_ok=True)
     torch.manual_seed(a.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -567,7 +575,8 @@ def main(argv=None):
     if a.stage in {"all", "train"}:
         teacher = StandardViT(dim=a.dim, depth=a.depth, heads=a.heads,
                               patch=a.patch, mlp_ratio=a.mlp_ratio,
-                              norm_type=a.norm_type, qk_norm=a.qk_norm)
+                              norm_type=a.norm_type, qk_norm=a.qk_norm,
+                              qk_norm_type=a.qk_norm_type)
         print(f"StandardViT: {sum(p.numel() for p in teacher.parameters()):,} parameters; "
               f"device={device}")
         train_teacher(teacher, train_dl, val_dl, a, device, teacher_path)
@@ -579,8 +588,9 @@ def main(argv=None):
     teacher = load_teacher(teacher_path, device)
     save_quantizer_arrays(a, calib_ds, test_ds, indices, teacher.patch)
     teacher_acc = evaluate(teacher, val_dl, device)
-    norm_mode = ("rms_matmul" if teacher.norm_type == "rms" else "matmul") if a.norm_mode == "auto" else a.norm_mode
-    print(f"Teacher validation ({teacher.norm_type.upper()}+QK-Norm={teacher.qk_norm}"
+    norm_mode = resolve_norm_mode(teacher.norm_type, requested_norm_mode)
+    qk_type = teacher.qk_norm_type.upper() if teacher.qk_norm else "off"
+    print(f"Teacher validation ({teacher.norm_type.upper()}+Q/K={qk_type}"
           f"+GELU+Softmax): {teacher_acc:.4%}")
     if a.resume_finetune:
         latest_path = Path(a.out) / "vit_npu_latest.pt"

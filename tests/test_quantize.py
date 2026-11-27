@@ -21,10 +21,12 @@ def test_npy_reader_rewind_and_validation():
         NpyReader(np.empty((0, 16, 192), dtype=np.float32))
 
 
-def test_quantize_ort_cpu_cli(tmp_path):
+@pytest.mark.parametrize("norm_type", ["rms", "harddyt"])
+def test_quantize_ort_cpu_cli(tmp_path, norm_type):
     pytest.importorskip("onnx")
     ort = pytest.importorskip("onnxruntime")
-    teacher = StandardViT(patch=8, dim=32, depth=1, heads=4).eval()
+    teacher = StandardViT(patch=8, dim=32, depth=1, heads=4,
+                          norm_type=norm_type, qk_norm_type=norm_type).eval()
     calibration_images = [torch.randn(4, 3, 32, 32)]
     student = convert_to_npu(teacher, calibration_images, softmax_kind="mlp", mlp_fit_steps=5, mlp_rows=64, verbose=False)
     src = tmp_path / "vit_npu.onnx"

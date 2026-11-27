@@ -1,9 +1,6 @@
-"""Standard RMSNorm + QK-Norm ViT -> calibrated ReLU / PWL NPU ViT.
+"""ViT with RMSNorm, LayerNorm, DyT or HardDyT and a calibrated NPU student.
 
-Teacher trains with dynamic RMSNorm, per-head Q/K RMSNorm, GELU and Softmax.
-Student uses equivalent MatMul RMSNorm, calibrated GELU -> ReLU, and either
-a learned six-neuron per-head ReLU MLP, fixed PWL, or native Softmax.
-The preceding LayerNorm (ln) architecture remains available as an ablation.
+The student uses calibrated ReLU and learned MLP, fixed PWL, or native Softmax.
 FP32 graph suitability and real INT8 NPU partitioning are distinct checks.
 """
 
@@ -94,6 +91,61 @@ class MatMulHeadRMSNorm(nn.Module):
         return x / torch.sqrt((x * x) @ self.avg + self.eps) * self.weight[None, :, None, :]
 
 
+class DynamicTanh(nn.Module):
+    """Learned input scale and channel affine around a pointwise tanh.
+
+    With heads set, the input layout is [batch, heads, tokens, dim] and each
+    head learns its own scale and channel affine.
+    """
+
+    activation = staticmethod(torch.tanh)
+
+    def __init__(self, dim: int, *, heads: int | None = None):
+        super().__init__()
+        self.heads = heads
+        self.alpha = nn.Parameter(torch.full(() if heads is None else (heads,), 0.5))
+        affine_shape = (dim,) if heads is None else (heads, dim)
+        self.weight = nn.Parameter(torch.ones(affine_shape))
+        self.bias = nn.Parameter(torch.zeros(affine_shape))
+
+    def forward(self, x):
+        if self.alpha is not None:
+            alpha = self.alpha if self.heads is None else self.alpha[:, None, None]
+            x = x * alpha
+        x = self.activation(x)
+        if self.weight is not None:
+            if self.heads is None:
+                return x * self.weight + self.bias
+            return x * self.weight[:, None, :] + self.bias[:, None, :]
+        return x
+
+
+class DynamicHardTanh(DynamicTanh):
+    """DyT with a fixed [-1, 1] clip in place of tanh."""
+
+    activation = staticmethod(F.hardtanh)
+
+
+POINTWISE_NORMS = {"dyt": DynamicTanh, "harddyt": DynamicHardTanh}
+NORM_MODES = {
+    "rms": ("rms_matmul",),
+    "ln": ("matmul", "affine"),
+    "dyt": ("pointwise",),
+    "harddyt": ("pointwise",),
+}
+
+
+def resolve_norm_mode(norm_type, norm_mode=None):
+    if norm_type not in NORM_MODES:
+        raise ValueError(f"Unknown norm_type: {norm_type}")
+    modes = NORM_MODES[norm_type]
+    if norm_mode is None:
+        return modes[0]
+    if norm_mode not in modes:
+        raise ValueError(f"norm_type={norm_type!r} requires norm_mode in {modes}")
+    return norm_mode
+
+
 class StaticChannelNorm(nn.Module):
     """Trainable per-channel affine approximation to LayerNorm.
 
@@ -130,6 +182,18 @@ class MatMulLayerNorm(nn.Module):
         center = x - (x @ self.avg)
         variance = (center * center) @ self.avg
         return (center / torch.sqrt(variance + self.eps)) * self.weight + self.bias
+
+
+def _token_norm(dim, norm_type, norm_mode, adapted):
+    if norm_type in POINTWISE_NORMS:
+        norm = POINTWISE_NORMS[norm_type]
+    elif norm_type == "rms":
+        norm = MatMulRMSNorm if adapted else TokenRMSNorm
+    elif not adapted:
+        norm = nn.LayerNorm
+    else:
+        norm = StaticChannelNorm if norm_mode == "affine" else MatMulLayerNorm
+    return norm(dim)
 
 
 class CalibratedReLU(nn.Module):
@@ -432,10 +496,13 @@ def fit_mlp_softmax(module, rows, *, steps=150, lr=0.0003, batch_rows=128, verbo
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads, n_tokens, *, qk_norm=True, adapted=False):
+    def __init__(self, dim, heads, n_tokens, *, qk_norm=True, qk_norm_type="rms",
+                 adapted=False):
         super().__init__()
         if dim % heads:
             raise ValueError("dim must be divisible by heads")
+        if qk_norm_type != "rms" and qk_norm_type not in POINTWISE_NORMS:
+            raise ValueError(f"Unknown qk_norm_type: {qk_norm_type}")
         self.heads, self.hd = heads, dim // heads
         self.scale = self.hd ** -0.5
         self.q = nn.Linear(dim, dim)
@@ -443,13 +510,17 @@ class Attention(nn.Module):
         self.v = nn.Linear(dim, dim)
         self.proj = nn.Linear(dim, dim)
         self.qk_norm = qk_norm
-        if qk_norm:
+        if not qk_norm:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+        elif qk_norm_type == "rms":
             qkn = MatMulHeadRMSNorm if adapted else HeadRMSNorm
             self.q_norm = qkn(heads, self.hd)
             self.k_norm = qkn(heads, self.hd)
         else:
-            self.q_norm = nn.Identity()
-            self.k_norm = nn.Identity()
+            qkn = POINTWISE_NORMS[qk_norm_type]
+            self.q_norm = qkn(self.hd, heads=heads)
+            self.k_norm = qkn(self.hd, heads=heads)
         self.norm = nn.Softmax(dim=-1)
         self.n_tokens = n_tokens
 
@@ -458,7 +529,7 @@ class Attention(nn.Module):
         q = self.q(x).reshape(b, n, self.heads, self.hd).transpose(1, 2)
         k = self.k(x).reshape(b, n, self.heads, self.hd).transpose(1, 2)
         v = self.v(x).reshape(b, n, self.heads, self.hd).transpose(1, 2)
-        # Query and Key are normalized independently, prior to Q @ K^T.
+        # Q and K have independent transforms before Q @ K^T.
         q = self.q_norm(q)
         k = self.k_norm(k)
         attention = self.norm((q @ k.transpose(-2, -1)) * self.scale)
@@ -467,17 +538,12 @@ class Attention(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim, heads, mlp_ratio, n_tokens, *, adapted=False,
-                 norm_type="rms", norm_mode="rms_matmul", qk_norm=True):
+                 norm_type="rms", norm_mode=None, qk_norm=True, qk_norm_type="rms"):
         super().__init__()
-        if norm_type == "rms":
-            norm = MatMulRMSNorm if adapted else TokenRMSNorm
-        elif norm_type == "ln":
-            norm = (StaticChannelNorm if norm_mode == "affine" else MatMulLayerNorm) if adapted else nn.LayerNorm
-        else:
-            raise ValueError(f"Unknown norm_type: {norm_type}")
-        self.norm1 = norm(dim)
-        self.attn = Attention(dim, heads, n_tokens, qk_norm=qk_norm, adapted=adapted)
-        self.norm2 = norm(dim)
+        self.norm1 = _token_norm(dim, norm_type, norm_mode, adapted)
+        self.attn = Attention(dim, heads, n_tokens, qk_norm=qk_norm,
+                              qk_norm_type=qk_norm_type, adapted=adapted)
+        self.norm2 = _token_norm(dim, norm_type, norm_mode, adapted)
         self.fc1 = nn.Linear(dim, dim * mlp_ratio)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(dim * mlp_ratio, dim)
@@ -490,26 +556,19 @@ class Block(nn.Module):
 class _ViT(nn.Module):
     def __init__(self, img_size=32, patch=4, in_ch=3, num_classes=10,
                  dim=128, depth=6, heads=4, mlp_ratio=2, adapted=False,
-                 norm_type="rms", norm_mode=None, qk_norm=True):
+                 norm_type="rms", norm_mode=None, qk_norm=True, qk_norm_type="rms"):
         super().__init__()
         if img_size % patch:
             raise ValueError("img_size must be divisible by patch")
-        if norm_type not in {"rms", "ln"}:
-            raise ValueError("norm_type must be rms or ln")
-        if norm_mode is None:
-            norm_mode = "rms_matmul" if norm_type == "rms" else "matmul"
-        if norm_mode not in {"affine", "matmul", "rms_matmul"}:
-            raise ValueError("norm_mode must be affine, matmul or rms_matmul")
-        if adapted and ((norm_type == "rms" and norm_mode != "rms_matmul") or
-                        (norm_type == "ln" and norm_mode == "rms_matmul")):
-            raise ValueError("rms requires rms_matmul; ln requires matmul or affine")
+        norm_mode = resolve_norm_mode(norm_type, norm_mode)
         self.config = dict(img_size=img_size, patch=patch, in_ch=in_ch,
                            num_classes=num_classes, dim=dim, depth=depth,
                            heads=heads, mlp_ratio=mlp_ratio,
-                           norm_type=norm_type, qk_norm=qk_norm)
+                           norm_type=norm_type, qk_norm=qk_norm, qk_norm_type=qk_norm_type)
         self.norm_mode = norm_mode
         self.norm_type = norm_type
         self.qk_norm = qk_norm
+        self.qk_norm_type = qk_norm_type
         self.patch = patch
         self.n_tokens = (img_size // patch) ** 2
         self.patch_dim = in_ch * patch * patch
@@ -518,14 +577,11 @@ class _ViT(nn.Module):
         nn.init.trunc_normal_(self.pos, std=0.02)
         self.blocks = nn.ModuleList(
             Block(dim, heads, mlp_ratio, self.n_tokens, adapted=adapted,
-                  norm_type=norm_type, norm_mode=norm_mode, qk_norm=qk_norm)
+                  norm_type=norm_type, norm_mode=norm_mode, qk_norm=qk_norm,
+                  qk_norm_type=qk_norm_type)
             for _ in range(depth)
         )
-        if norm_type == "rms":
-            norm = MatMulRMSNorm if adapted else TokenRMSNorm
-        else:
-            norm = (StaticChannelNorm if norm_mode == "affine" else MatMulLayerNorm) if adapted else nn.LayerNorm
-        self.norm = norm(dim)
+        self.norm = _token_norm(dim, norm_type, norm_mode, adapted)
         self.register_buffer("avg", torch.full((1, self.n_tokens), 1.0 / self.n_tokens))
         self.head = nn.Linear(dim, num_classes)
 
@@ -545,7 +601,7 @@ class StandardViT(_ViT):
 
 
 class NPUViT(_ViT):
-    """Student: constant-MatMul RMSNorm/QK-Norm + calibrated ReLU and PWL."""
+    """Student with export-oriented normalization, ReLU and attention."""
 
     def __init__(self, norm_mode=None, **kwargs):
         super().__init__(adapted=True, norm_mode=norm_mode, **kwargs)
@@ -682,19 +738,14 @@ def _check_calib_loader(loader):
 @torch.no_grad()
 def fit_static_norms(teacher: StandardViT, calibration_loader, max_batches=None,
                      norm_mode=None):
-    """Transfer trained RMSNorm weights exactly, or fit legacy LN affine."""
+    """Transfer trained normalization parameters, or fit a legacy LN affine."""
     _check_calib_loader(calibration_loader)
     if max_batches is not None and max_batches < 1:
         raise ValueError("max_batches must be positive")
-    if norm_mode is None:
-        norm_mode = "rms_matmul" if teacher.norm_type == "rms" else "matmul"
-    if teacher.norm_type == "rms" and norm_mode != "rms_matmul":
-        raise ValueError("RMSNorm teachers require norm_mode='rms_matmul'")
-    if teacher.norm_type == "ln" and norm_mode not in {"matmul", "affine"}:
-        raise ValueError("LayerNorm teachers require norm_mode='matmul' or 'affine'")
+    norm_mode = resolve_norm_mode(teacher.norm_type, norm_mode)
     device = next(teacher.parameters()).device
     teacher.eval()
-    if norm_mode in {"matmul", "rms_matmul"}:
+    if norm_mode != "affine":
         student = NPUViT(**teacher.config, norm_mode=norm_mode).to(device)
         # avg MatMul buffers are nonpersistent; all trainable parameter keys match.
         student.load_state_dict(teacher.state_dict(), strict=True)
@@ -821,7 +872,7 @@ def convert_to_npu(
     knot_spacing="geometric",
     verbose=True,
 ):
-    """Transfer teacher weights, preserve RMSNorm, calibrate ReLU/Softmax."""
+    """Transfer teacher weights and calibrate ReLU and attention."""
     student = fit_static_norms(teacher, calibration_loader, max_batches=max_batches,
                                norm_mode=norm_mode)
     return calibrate_npu(
@@ -883,39 +934,42 @@ def measure_saturation(student, validation_loader, max_batches=None):
 
 @torch.no_grad()
 def fold_affine_norms(student: NPUViT):
-    """Fold affine norms when available, always fold calibrated ReLU gain/bias.
-
-    MatMulLayerNorm, MatMulRMSNorm and MatMulHeadRMSNorm remain dynamic.
-    """
+    """Fold token affines, Q/K input scales, and calibrated ReLU affines for export."""
     if any(not isinstance(b.attn.norm, (FixedPWLSoftmax, LearnedMLPSoftmax, nn.Softmax)) or
            not isinstance(b.act, CalibratedReLU) for b in student.blocks):
         raise ValueError("Calibrate all ReLU and attention layers before folding")
     m = copy.deepcopy(student).eval()
 
-    def fold(norm, *linears):
-        w, b = norm.weight.detach(), norm.bias.detach()
+    def fold_affine(gain, bias, *linears):
         for linear in linears:
-            old = linear.weight.detach().clone()
-            linear.bias.add_(old @ b)
-            linear.weight.mul_(w[None, :])
+            linear.bias.add_(linear.weight @ bias)
+            linear.weight.mul_(gain[None, :])
+
+    def fold_token_norm(norm, *linears):
+        if isinstance(norm, StaticChannelNorm):
+            fold_affine(norm.weight, norm.bias, *linears)
+            return nn.Identity()
+        if isinstance(norm, DynamicTanh):
+            fold_affine(norm.weight, norm.bias, *linears)
+            norm.weight = norm.bias = None
+        return norm
 
     for block in m.blocks:
-        if isinstance(block.norm1, StaticChannelNorm):
-            fold(block.norm1, block.attn.q, block.attn.k, block.attn.v)
-            block.norm1 = nn.Identity()
-        if isinstance(block.norm2, StaticChannelNorm):
-            fold(block.norm2, block.fc1)
-            block.norm2 = nn.Identity()
+        attn = block.attn
+        block.norm1 = fold_token_norm(block.norm1, attn.q, attn.k, attn.v)
+        block.norm2 = fold_token_norm(block.norm2, block.fc1)
+        for norm, proj in ((attn.q_norm, attn.q), (attn.k_norm, attn.k)):
+            if isinstance(norm, DynamicTanh):
+                # Each head is a contiguous group of output channels.
+                scale = norm.alpha.repeat_interleave(attn.hd)
+                proj.weight.mul_(scale[:, None])
+                proj.bias.mul_(scale)
+                norm.alpha = None
         # GELU -> calibrated ReLU, with gain+bias absorbed into the output Linear.
-        gain, bias = block.act.gain.detach(), block.act.bias.detach()
-        old_weight = block.fc2.weight.detach().clone()
-        block.fc2.bias.add_(old_weight @ bias)
-        block.fc2.weight.mul_(gain[None, :])
+        fold_affine(block.act.gain, block.act.bias, block.fc2)
         block.act = nn.ReLU()
     # Mean over tokens commutes with any per-channel affine map.
-    if isinstance(m.norm, StaticChannelNorm):
-        fold(m.norm, m.head)
-        m.norm = nn.Identity()
+    m.norm = fold_token_norm(m.norm, m.head)
     return m
 
 
@@ -929,7 +983,7 @@ XINT8_LISTED = {
 
 
 def export_onnx(model, path):
-    """Export folded fixed-PWL student (never the normal teacher)."""
+    """Export a folded, calibrated student to ONNX."""
     folded = fold_affine_norms(model)
     parameter = next(folded.parameters())
     dummy = torch.randn(1, folded.n_tokens, folded.patch_dim, device=parameter.device,
